@@ -255,6 +255,7 @@ async def _run_browser_task(cdp_url: str, task: str, max_steps: int) -> dict:
 
     llm = ChatOpenRouter(
         model=os.getenv("BROWSER_USE_LLM_MODEL", "moonshotai/kimi-k2.5"),
+        api_key=os.getenv("OPENROUTER_API_KEY"),
     )
 
     browser = Browser(cdp_url=cdp_url)
