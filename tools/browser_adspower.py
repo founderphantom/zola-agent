@@ -232,6 +232,74 @@ def _run_async(coro):
 # Tool handlers
 # ---------------------------------------------------------------------------
 
+def _handle_sync_accounts(args: dict, **kw) -> str:
+    """Fetch all profiles from AdsPower API and write adspower_accounts.json."""
+    api_url = _get_api_url()
+    page = 1
+    all_profiles = []
+
+    try:
+        while True:
+            resp = requests.get(
+                f"{api_url}/api/v1/user/list",
+                params={"page": page, "page_size": 100},
+                headers=_api_headers(),
+                timeout=15,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            if data.get("code") != 0:
+                return json.dumps({
+                    "success": False,
+                    "error": f"AdsPower API error: {data.get('msg', 'unknown')}",
+                })
+
+            profiles = data.get("data", {}).get("list", [])
+            if not profiles:
+                break
+
+            for p in profiles:
+                all_profiles.append({
+                    "name": p.get("name", p.get("serial_number", "unnamed")),
+                    "profile_id": p.get("user_id", ""),
+                    "description": p.get("remark", ""),
+                })
+
+            page_count = data.get("data", {}).get("page_count", 1)
+            if page >= page_count:
+                break
+            page += 1
+
+    except requests.ConnectionError:
+        return json.dumps({
+            "success": False,
+            "error": (
+                f"Cannot reach AdsPower at {api_url}. "
+                "Ensure AdsPower is running and ADSPOWER_API_URL is correct."
+            ),
+        })
+    except Exception as e:
+        return json.dumps({"success": False, "error": str(e)})
+
+    if not all_profiles:
+        return json.dumps({
+            "success": False,
+            "error": "No profiles found in AdsPower.",
+        })
+
+    config_path = _get_hermes_home() / "adspower_accounts.json"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(json.dumps({"accounts": all_profiles}, indent=2))
+    logger.info("Synced %d profiles to %s", len(all_profiles), config_path)
+
+    return json.dumps({
+        "success": True,
+        "synced": len(all_profiles),
+        "accounts": all_profiles,
+        "config_path": str(config_path),
+    })
+
+
 def _handle_list_accounts(args: dict, **kw) -> str:
     accounts = _load_accounts()
     if not accounts:
@@ -359,6 +427,20 @@ def _handle_close(args: dict, **kw) -> str:
 # Tool schemas
 # ---------------------------------------------------------------------------
 
+ADSPOWER_SYNC_SCHEMA = {
+    "name": "adspower_sync",
+    "description": (
+        "Fetch all browser profiles from the AdsPower API and save them to "
+        "~/.hermes/adspower_accounts.json. Run this to populate or refresh "
+        "the account list from AdsPower."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+    },
+}
+
 ADSPOWER_LIST_ACCOUNTS_SCHEMA = {
     "name": "adspower_list_accounts",
     "description": (
@@ -436,13 +518,13 @@ ADSPOWER_CLOSE_SCHEMA = {
 # Availability check
 # ---------------------------------------------------------------------------
 
-def check_adspower_requirements() -> bool:
-    """Return True when AdsPower tools should be available.
+def _check_adspower_api() -> bool:
+    """Return True when AdsPower API env is configured (for sync tool)."""
+    return bool(_get_api_key() or os.getenv("ADSPOWER_API_URL"))
 
-    Requires ADSPOWER_API_URL to be set (or uses default) and the accounts
-    config file to exist.  browser-use + langchain-openai are checked at
-    call time, not registration time, so they don't block other tools.
-    """
+
+def _check_adspower_accounts() -> bool:
+    """Return True when accounts config exists (for browse/list/close tools)."""
     config_path = _get_hermes_home() / "adspower_accounts.json"
     return config_path.exists()
 
@@ -452,11 +534,23 @@ def check_adspower_requirements() -> bool:
 # ---------------------------------------------------------------------------
 
 registry.register(
+    name="adspower_sync",
+    toolset="adspower",
+    schema=ADSPOWER_SYNC_SCHEMA,
+    handler=_handle_sync_accounts,
+    check_fn=_check_adspower_api,
+    requires_env=[],
+    is_async=False,
+    description="Sync profiles from AdsPower API",
+    emoji="🔄",
+)
+
+registry.register(
     name="adspower_list_accounts",
     toolset="adspower",
     schema=ADSPOWER_LIST_ACCOUNTS_SCHEMA,
     handler=_handle_list_accounts,
-    check_fn=check_adspower_requirements,
+    check_fn=_check_adspower_accounts,
     requires_env=[],
     is_async=False,
     description="List AdsPower browser profiles",
@@ -468,7 +562,7 @@ registry.register(
     toolset="adspower",
     schema=ADSPOWER_BROWSE_SCHEMA,
     handler=_handle_browse,
-    check_fn=check_adspower_requirements,
+    check_fn=_check_adspower_accounts,
     requires_env=["OPENROUTER_API_KEY"],
     is_async=False,
     description="Run browser task on AdsPower profile",
@@ -480,7 +574,7 @@ registry.register(
     toolset="adspower",
     schema=ADSPOWER_CLOSE_SCHEMA,
     handler=_handle_close,
-    check_fn=check_adspower_requirements,
+    check_fn=_check_adspower_accounts,
     requires_env=[],
     is_async=False,
     description="Close AdsPower browser session",
