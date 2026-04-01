@@ -11,18 +11,15 @@ over CDP for autonomous page interaction.
 Architecture:
     hermes-agent (Kimi K2.5) → adspower_browse tool
         → AdsPower V2 API (start profile) → ws:// CDP URL
-        → URL rewrite (127.0.0.1 → host.docker.internal)
         → browser-use Browser(cdp_url=...) + Agent(task=..., llm=...)
         → AdsPower V1 API (stop profile)
 
 Environment Variables:
     ADSPOWER_API_URL:  AdsPower Local API base URL
-                       (default: http://host.docker.internal:50325)
+                       (default: http://127.0.0.1:50325)
     ADSPOWER_API_KEY:  Optional API key for AdsPower auth
     BROWSER_USE_LLM_MODEL:  LLM model for browser-use Agent
                             (default: moonshotai/kimi-k2.5)
-    BROWSER_USE_LLM_BASE_URL:  LLM base URL
-                               (default: https://openrouter.ai/api/v1)
     OPENROUTER_API_KEY:  API key for the LLM provider
 
 Config File:
@@ -49,7 +46,7 @@ logger = logging.getLogger(__name__)
 # Configuration helpers
 # ---------------------------------------------------------------------------
 
-_DEFAULT_API_URL = "http://host.docker.internal:50325"
+_DEFAULT_API_URL = "http://172.22.0.1:50326"
 
 
 def _get_api_url() -> str:
@@ -78,16 +75,15 @@ def _load_accounts() -> list:
 
 
 # ---------------------------------------------------------------------------
-# URL rewriting (Docker → Windows host)
+# URL rewriting (WSL2 → Windows host)
 # ---------------------------------------------------------------------------
 
 def _rewrite_ws_url(ws_url: str) -> str:
     """Replace 127.0.0.1/localhost in AdsPower's WS URL with the API host.
 
     AdsPower returns ws://127.0.0.1:XXXXX/devtools/browser/UUID but from
-    inside Docker, 127.0.0.1 means the container itself.  We swap in the
-    host from ADSPOWER_API_URL which the user has configured to reach the
-    Windows host.
+    WSL2, 127.0.0.1 means the Linux VM itself.  We swap in the host from
+    ADSPOWER_API_URL (the Windows host gateway IP) so CDP connects correctly.
     """
     api_host = urlparse(_get_api_url()).hostname
     if not api_host or api_host in ("127.0.0.1", "localhost"):
@@ -202,14 +198,10 @@ def _resolve_account(account_name: Optional[str]) -> Dict[str, Any]:
 async def _run_browser_task(cdp_url: str, task: str, max_steps: int) -> dict:
     """Connect browser-use to an AdsPower CDP endpoint and run a task."""
     from browser_use import Agent, Browser
-    from langchain_openai import ChatOpenAI
+    from browser_use.llm.openrouter.chat import ChatOpenRouter
 
-    llm = ChatOpenAI(
+    llm = ChatOpenRouter(
         model=os.getenv("BROWSER_USE_LLM_MODEL", "moonshotai/kimi-k2.5"),
-        base_url=os.getenv(
-            "BROWSER_USE_LLM_BASE_URL", "https://openrouter.ai/api/v1"
-        ),
-        api_key=os.getenv("OPENROUTER_API_KEY"),
     )
 
     browser = Browser(cdp_url=cdp_url)
