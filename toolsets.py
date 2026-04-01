@@ -64,6 +64,8 @@ _HERMES_CORE_TOOLS = [
     "honcho_context", "honcho_profile", "honcho_search", "honcho_conclude",
     # Home Assistant smart home control (gated on HASS_TOKEN via check_fn)
     "ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service",
+    # AdsPower anti-detect browser automation (gated on accounts config)
+    "adspower_list_accounts", "adspower_browse", "adspower_close",
 ]
 
 
@@ -205,6 +207,12 @@ TOOLSETS = {
     "homeassistant": {
         "description": "Home Assistant smart home control and monitoring",
         "tools": ["ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service"],
+        "includes": []
+    },
+
+    "adspower": {
+        "description": "AdsPower anti-detect browser automation for multi-account workflows",
+        "tools": ["adspower_list_accounts", "adspower_browse", "adspower_close"],
         "includes": []
     },
 
