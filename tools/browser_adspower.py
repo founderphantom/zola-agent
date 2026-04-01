@@ -31,7 +31,9 @@ import atexit
 import json
 import logging
 import os
+import subprocess
 import threading
+import time
 from pathlib import Path
 from typing import Any, Dict, Optional
 from urllib.parse import urlparse
@@ -75,23 +77,39 @@ def _load_accounts() -> list:
 
 
 # ---------------------------------------------------------------------------
-# URL rewriting (WSL2 → Windows host)
+# WSL2 → Windows CDP bridge (socat)
 # ---------------------------------------------------------------------------
 
-def _rewrite_ws_url(ws_url: str) -> str:
-    """Replace 127.0.0.1/localhost in AdsPower's WS URL with the API host.
+def _start_cdp_proxy(port: int) -> Optional[subprocess.Popen]:
+    """Start a socat process in WSL2 that bridges WSL2 localhost to Windows host CDP port.
 
-    AdsPower returns ws://127.0.0.1:XXXXX/devtools/browser/UUID but from
-    WSL2, 127.0.0.1 means the Linux VM itself.  We swap in the host from
-    ADSPOWER_API_URL (the Windows host gateway IP) so CDP connects correctly.
+    AdsPower returns ws://127.0.0.1:PORT/... but from WSL2, 127.0.0.1 is the
+    Linux VM.  socat listens on WSL2's 127.0.0.1:PORT and forwards outbound to
+    the Windows host IP (from ADSPOWER_API_URL) on the same port — the same
+    path that already works for AdsPower API calls.
+
+    Requires: sudo apt install socat
     """
     api_host = urlparse(_get_api_url()).hostname
     if not api_host or api_host in ("127.0.0.1", "localhost"):
-        return ws_url  # No rewriting needed when running on same host
-    rewritten = ws_url.replace("127.0.0.1", api_host).replace("localhost", api_host)
-    if rewritten != ws_url:
-        logger.info("Rewrote WebSocket URL: %s → %s", ws_url, rewritten)
-    return rewritten
+        return None  # Same host — no proxy needed
+
+    try:
+        proc = subprocess.Popen(
+            ["socat", f"TCP-LISTEN:{port},fork,reuseaddr", f"TCP:{api_host}:{port}"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        time.sleep(0.2)  # let socat bind before browser-use connects
+        logger.info("socat CDP proxy started: 127.0.0.1:%d → %s:%d (pid %d)",
+                    port, api_host, port, proc.pid)
+        return proc
+    except FileNotFoundError:
+        logger.error("socat not found — install with: sudo apt install socat")
+        return None
+    except Exception as e:
+        logger.warning("socat CDP proxy failed for port %d: %s", port, e)
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -106,8 +124,13 @@ def _api_headers() -> dict:
     return headers
 
 
-def _start_profile(profile_id: str) -> str:
-    """Start an AdsPower profile via V2 API, return rewritten WebSocket URL."""
+def _start_profile(profile_id: str) -> tuple[str, Optional[subprocess.Popen]]:
+    """Start an AdsPower profile via V2 API.
+
+    Returns (ws_url, proxy_proc) where ws_url is the original CDP URL
+    (ws://127.0.0.1:PORT/...) and proxy_proc is a socat process that bridges
+    WSL2's 127.0.0.1:PORT → Windows host:PORT, or None when no proxy is needed.
+    """
     api_url = _get_api_url()
     resp = requests.post(
         f"{api_url}/api/v2/browser-profile/start",
@@ -129,9 +152,11 @@ def _start_profile(profile_id: str) -> str:
         )
 
     ws_url = data["data"]["ws"]["puppeteer"]
+    port = urlparse(ws_url).port
+    proxy_proc = _start_cdp_proxy(port) if port else None
     logger.info("AdsPower profile %s started, CDP port: %s",
-                profile_id, data["data"].get("debug_port", "?"))
-    return _rewrite_ws_url(ws_url)
+                profile_id, port or "?")
+    return ws_url, proxy_proc
 
 
 def _stop_profile(profile_id: str) -> bool:
@@ -165,10 +190,13 @@ _sessions_lock = threading.Lock()
 
 
 def _cleanup_all_sessions():
-    """Emergency cleanup at exit — stop all AdsPower profiles."""
+    """Emergency cleanup at exit — stop all AdsPower profiles and socat proxies."""
     with _sessions_lock:
         for name, session in list(_active_sessions.items()):
             try:
+                proxy = session.get("proxy_proc")
+                if proxy:
+                    proxy.terminate()
                 _stop_profile(session["profile_id"])
             except Exception:
                 pass
@@ -360,7 +388,7 @@ def _handle_browse(args: dict, **kw) -> str:
         logger.info("Reusing existing session for %s", account_name)
     else:
         try:
-            ws_url = _start_profile(profile_id)
+            ws_url, proxy_proc = _start_profile(profile_id)
         except requests.ConnectionError:
             return json.dumps({
                 "success": False,
@@ -377,6 +405,7 @@ def _handle_browse(args: dict, **kw) -> str:
             _active_sessions[account_name] = {
                 "profile_id": profile_id,
                 "ws_url": ws_url,
+                "proxy_proc": proxy_proc,
             }
 
     # Run browser-use Agent
@@ -411,6 +440,9 @@ def _handle_close(args: dict, **kw) -> str:
     for name, session in targets.items():
         if session is None:
             continue
+        proxy = session.get("proxy_proc")
+        if proxy:
+            proxy.terminate()
         _stop_profile(session["profile_id"])
         closed.append(name)
 
