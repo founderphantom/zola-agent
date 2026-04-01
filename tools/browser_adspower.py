@@ -77,38 +77,55 @@ def _load_accounts() -> list:
 
 
 # ---------------------------------------------------------------------------
-# WSL2 → Windows CDP bridge (socat)
+# WSL2 → Windows CDP bridge
 # ---------------------------------------------------------------------------
 
 def _start_cdp_proxy(port: int) -> Optional[subprocess.Popen]:
-    """Start a socat process in WSL2 that bridges WSL2 localhost to Windows host CDP port.
+    """Spawn a Windows-side TCP relay that bridges 0.0.0.0:PORT → 127.0.0.1:PORT.
 
-    AdsPower returns ws://127.0.0.1:PORT/... but from WSL2, 127.0.0.1 is the
-    Linux VM.  socat listens on WSL2's 127.0.0.1:PORT and forwards outbound to
-    the Windows host IP (from ADSPOWER_API_URL) on the same port — the same
-    path that already works for AdsPower API calls.
+    Problem: AdsPower Chrome binds CDP to Windows 127.0.0.1:PORT only.
+    From WSL2, 127.0.0.1 is the Linux VM loopback — not Windows.
+    172.22.0.1 is the Windows WSL adapter, but Chrome is NOT listening there.
 
-    Requires: sudo apt install socat
+    Solution: powershell.exe called from WSL2 runs on Windows as the current
+    user (no admin required for user-space ports >1024).  It binds a TCP
+    listener on 0.0.0.0:PORT on Windows, which accepts the connection arriving
+    on 172.22.0.1:PORT from WSL2 and relays it to 127.0.0.1:PORT where Chrome
+    is actually listening.
     """
     api_host = urlparse(_get_api_url()).hostname
     if not api_host or api_host in ("127.0.0.1", "localhost"):
-        return None  # Same host — no proxy needed
+        return None  # Running natively on Windows — no bridge needed
 
+    # Bind to api_host specifically (e.g. 172.22.0.1), NOT 0.0.0.0.
+    # Chrome already holds 127.0.0.1:PORT — binding Any would conflict.
+    # Binding to a different IP on the same port is allowed.
+    ps = (
+        f"$l=[Net.Sockets.TcpListener]::new([Net.IPAddress]::Parse('{api_host}'),{port});"
+        "try{$l.Start()}catch{exit};"
+        "while($true){"
+        "$c=$l.AcceptTcpClient();"
+        f"$t=New-Object Net.Sockets.TcpClient('127.0.0.1',{port});"
+        "$cs=$c.GetStream();$ts=$t.GetStream();"
+        "[void][Threading.Tasks.Task]::Run([Action]{try{$cs.CopyTo($ts)}catch{}});"
+        "[void][Threading.Tasks.Task]::Run([Action]{try{$ts.CopyTo($cs)}catch{}})}"
+    )
     try:
         proc = subprocess.Popen(
-            ["socat", f"TCP-LISTEN:{port},fork,reuseaddr", f"TCP:{api_host}:{port}"],
+            ["powershell.exe", "-NoProfile", "-NonInteractive",
+             "-WindowStyle", "Hidden", "-Command", ps],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-        time.sleep(0.2)  # let socat bind before browser-use connects
-        logger.info("socat CDP proxy started: 127.0.0.1:%d → %s:%d (pid %d)",
-                    port, api_host, port, proc.pid)
+        time.sleep(0.5)  # let the listener bind before browser-use connects
+        logger.info("CDP proxy started on Windows port %d → 127.0.0.1:%d (pid %d)",
+                    port, port, proc.pid)
         return proc
     except FileNotFoundError:
-        logger.error("socat not found — install with: sudo apt install socat")
+        logger.error("powershell.exe not found — is this running in WSL2?")
         return None
     except Exception as e:
-        logger.warning("socat CDP proxy failed for port %d: %s", port, e)
+        logger.warning("CDP proxy failed for port %d: %s", port, e)
         return None
 
 
@@ -127,9 +144,9 @@ def _api_headers() -> dict:
 def _start_profile(profile_id: str) -> tuple[str, Optional[subprocess.Popen]]:
     """Start an AdsPower profile via V2 API.
 
-    Returns (ws_url, proxy_proc) where ws_url is the original CDP URL
-    (ws://127.0.0.1:PORT/...) and proxy_proc is a socat process that bridges
-    WSL2's 127.0.0.1:PORT → Windows host:PORT, or None when no proxy is needed.
+    Returns (ws_url, proxy_proc) where ws_url has 127.0.0.1 rewritten to the
+    Windows host IP and proxy_proc is a PowerShell TCP relay on Windows that
+    forwards 0.0.0.0:PORT → 127.0.0.1:PORT, or None when no bridge is needed.
     """
     api_url = _get_api_url()
     resp = requests.post(
@@ -154,9 +171,17 @@ def _start_profile(profile_id: str) -> tuple[str, Optional[subprocess.Popen]]:
     ws_url = data["data"]["ws"]["puppeteer"]
     port = urlparse(ws_url).port
     proxy_proc = _start_cdp_proxy(port) if port else None
-    logger.info("AdsPower profile %s started, CDP port: %s",
-                profile_id, port or "?")
-    return ws_url, proxy_proc
+
+    # Rewrite 127.0.0.1 → Windows host IP so browser-use reaches the proxy.
+    # The proxy (PowerShell) listens on 0.0.0.0:PORT on Windows and forwards
+    # to 127.0.0.1:PORT where Chrome is actually running.
+    api_host = urlparse(_get_api_url()).hostname or "127.0.0.1"
+    rewritten = ws_url.replace("127.0.0.1", api_host).replace("localhost", api_host)
+    if rewritten != ws_url:
+        logger.info("CDP URL rewritten: %s → %s", ws_url, rewritten)
+
+    logger.info("AdsPower profile %s started, CDP port: %s", profile_id, port or "?")
+    return rewritten, proxy_proc
 
 
 def _stop_profile(profile_id: str) -> bool:
