@@ -248,63 +248,6 @@ def _resolve_account(account_name: Optional[str]) -> Dict[str, Any]:
 # browser-use integration
 # ---------------------------------------------------------------------------
 
-def _build_upload_tools(win_to_wsl: Optional[dict] = None):
-    """Build browser-use Tools registry with a programmatic file-upload action.
-
-    Uses CDP's DOM.setFileInputFiles via browser-use's UploadFileEvent so the
-    agent never has to interact with native OS file-picker dialogs.
-
-    Args:
-        win_to_wsl: Mapping of Windows path → WSL path.  Needed because
-            os.path.exists() runs on WSL (needs /mnt/c/...) while Chrome/CDP
-            expects Windows paths (C:\\...).  If not provided, paths are
-            converted on the fly via _windows_to_wsl_path().
-    """
-    from browser_use import Tools, ActionResult, BrowserSession
-
-    _path_map = win_to_wsl or {}
-
-    tools = Tools()
-
-    @tools.action("Upload file to interactive element with file path")
-    async def upload_file(
-        index: int,
-        path: str,
-        browser_session: BrowserSession,
-        available_file_paths: list[str],
-    ) -> ActionResult:
-        if path not in available_file_paths:
-            return ActionResult(error=f"File path {path} is not in available_file_paths")
-
-        # Resolve the WSL-side path for validation (os.path.exists runs on
-        # WSL, but available_file_paths contains Windows paths for CDP).
-        wsl_path = _path_map.get(path) or _windows_to_wsl_path(path)
-        if not os.path.exists(wsl_path):
-            return ActionResult(
-                error=f"File not found at {wsl_path} (Windows: {path})"
-            )
-
-        dom_element = await browser_session.get_dom_element_by_index(index)
-        if dom_element is None:
-            return ActionResult(error=f"No element found at index {index}")
-
-        # Use the WINDOWS path for CDP — Chrome runs on Windows and needs
-        # a path it can resolve on its own filesystem.
-        from browser_use.browser.events import UploadFileEvent
-
-        event = browser_session.event_bus.dispatch(
-            UploadFileEvent(node=dom_element, file_path=path)
-        )
-        await event
-
-        return ActionResult(
-            extracted_content=f"Successfully uploaded {os.path.basename(path)} to element at index {index}",
-            include_in_memory=True,
-        )
-
-    return tools
-
-
 async def _run_browser_task(
     cdp_url: str, task: str, max_steps: int,
     file_paths: Optional[list] = None,
@@ -318,36 +261,33 @@ async def _run_browser_task(
         api_key=os.getenv("OPENROUTER_API_KEY"),
     )
 
-    # When file_paths are provided, register a custom upload_file tool and
-    # pass the paths via custom_context so the agent can upload files
-    # programmatically through CDP (no native file-picker dialogs).
+    # browser-use 2.x has a BUILT-IN upload_file action that dispatches
+    # UploadFileEvent via CDP (DOM.setFileInputFiles).  It needs:
+    #   1. available_file_paths passed directly to Agent()
+    #   2. Windows paths (Chrome runs on Windows, reads files from its FS)
     #
-    # file_paths contains WINDOWS paths (e.g. C:\Users\...) because Chrome
-    # on Windows needs them for DOM.setFileInputFiles.  We also build a
-    # win→wsl mapping so the upload tool can validate with os.path.exists()
-    # on the WSL side.
-    agent_kwargs: dict = {}
+    # Because we connect via cdp_url, browser_session.is_local == False,
+    # so the built-in upload_file SKIPS the os.path.exists() check that
+    # would fail for Windows paths on WSL.  It also skips strict
+    # available_file_paths enforcement for remote browsers, but we pass
+    # them anyway so the LLM agent knows which files are available.
     effective_task = task
     if file_paths:
-        win_to_wsl = {fp: _windows_to_wsl_path(fp) for fp in file_paths}
-        agent_kwargs["tools"] = _build_upload_tools(win_to_wsl=win_to_wsl)
-        agent_kwargs["custom_context"] = {
-            "available_file_paths": file_paths,
-        }
         file_list = "\n".join(f"  - {p}" for p in file_paths)
         effective_task = (
             f"{task}\n\n"
-            f"IMPORTANT: To upload photos, you MUST use the upload_file tool. "
-            f"Do NOT try to use a native file picker or drag-and-drop. Steps:\n"
-            f"1. Click the photo/file upload area to reveal the <input type='file'> element.\n"
-            f"2. Call upload_file(index=<element_index>, path=<file_path>) for each file.\n"
-            f"3. The element index is the number shown next to the file input in the DOM.\n\n"
-            f"Available files for upload:\n{file_list}"
+            f"IMPORTANT: To upload photos, use the upload_file action with "
+            f"the element index and file path. Click the photo/file upload "
+            f"area first, then call upload_file for each file below:\n"
+            f"{file_list}"
         )
 
     browser = Browser(cdp_url=cdp_url)
     agent = Agent(
-        task=effective_task, llm=llm, browser=browser, **agent_kwargs
+        task=effective_task,
+        llm=llm,
+        browser=browser,
+        available_file_paths=file_paths or None,
     )
     result = await agent.run(max_steps=max_steps)
 
