@@ -248,13 +248,21 @@ def _resolve_account(account_name: Optional[str]) -> Dict[str, Any]:
 # browser-use integration
 # ---------------------------------------------------------------------------
 
-def _build_upload_tools():
+def _build_upload_tools(win_to_wsl: Optional[dict] = None):
     """Build browser-use Tools registry with a programmatic file-upload action.
 
     Uses CDP's DOM.setFileInputFiles via browser-use's UploadFileEvent so the
     agent never has to interact with native OS file-picker dialogs.
+
+    Args:
+        win_to_wsl: Mapping of Windows path → WSL path.  Needed because
+            os.path.exists() runs on WSL (needs /mnt/c/...) while Chrome/CDP
+            expects Windows paths (C:\\...).  If not provided, paths are
+            converted on the fly via _windows_to_wsl_path().
     """
     from browser_use import Tools, ActionResult, BrowserSession
+
+    _path_map = win_to_wsl or {}
 
     tools = Tools()
 
@@ -268,13 +276,20 @@ def _build_upload_tools():
         if path not in available_file_paths:
             return ActionResult(error=f"File path {path} is not in available_file_paths")
 
-        if not os.path.exists(path):
-            return ActionResult(error=f"File {path} does not exist on disk")
+        # Resolve the WSL-side path for validation (os.path.exists runs on
+        # WSL, but available_file_paths contains Windows paths for CDP).
+        wsl_path = _path_map.get(path) or _windows_to_wsl_path(path)
+        if not os.path.exists(wsl_path):
+            return ActionResult(
+                error=f"File not found at {wsl_path} (Windows: {path})"
+            )
 
         dom_element = await browser_session.get_dom_element_by_index(index)
         if dom_element is None:
             return ActionResult(error=f"No element found at index {index}")
 
+        # Use the WINDOWS path for CDP — Chrome runs on Windows and needs
+        # a path it can resolve on its own filesystem.
         from browser_use.browser.events import UploadFileEvent
 
         event = browser_session.event_bus.dispatch(
@@ -570,6 +585,17 @@ def _wsl_to_windows_path(wsl_path: str) -> str:
         rest = "\\".join(parts[3:])
         return f"{drive}:\\{rest}"
     return wsl_path
+
+
+def _windows_to_wsl_path(win_path: str) -> str:
+    """Convert a C:\\... Windows path to a /mnt/c/... WSL path."""
+    # Handle both C:\\ and C:/ separators
+    normalized = win_path.replace("\\", "/")
+    if len(normalized) >= 2 and normalized[1] == ":":
+        drive = normalized[0].lower()
+        rest = normalized[2:].lstrip("/")
+        return f"/mnt/{drive}/{rest}"
+    return win_path
 
 
 def _handle_download_photos(args: dict, **kw) -> str:
