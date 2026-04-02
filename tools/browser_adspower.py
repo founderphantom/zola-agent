@@ -142,22 +142,34 @@ def _api_headers() -> dict:
 
 
 def _start_profile(profile_id: str) -> tuple[str, Optional[subprocess.Popen]]:
-    """Start an AdsPower profile via V2 API.
+    """Start an AdsPower profile via V1 API with launch_args.
+
+    Passes --remote-debugging-address=0.0.0.0 so Chrome listens on all
+    interfaces (required for WSL2 → Windows CDP access).  No manual
+    "Developer Mode" toggle needed per profile.
 
     Returns (ws_url, proxy_proc) where ws_url has 127.0.0.1 rewritten to the
     Windows host IP and proxy_proc is a PowerShell TCP relay on Windows that
     forwards 0.0.0.0:PORT → 127.0.0.1:PORT, or None when no bridge is needed.
     """
     api_url = _get_api_url()
-    resp = requests.post(
-        f"{api_url}/api/v2/browser-profile/start",
-        headers=_api_headers(),
-        json={
-            "profile_id": profile_id,
-            "last_opened_tabs": "0",
-            "proxy_detection": "0",
-            "cdp_mask": "1",
+
+    # Try V1 API first — better documented, explicitly supports launch_args.
+    # We pass --remote-debugging-address=0.0.0.0 so Chrome listens on all
+    # interfaces, which is required for WSL2 → Windows CDP connectivity.
+    # This eliminates the need to manually enable "Developer Mode" per profile.
+    resp = requests.get(
+        f"{api_url}/api/v1/browser/start",
+        params={
+            "user_id": profile_id,
+            "open_tabs": 0,
+            "ip_tab": 0,
+            "launch_args": json.dumps([
+                "--remote-debugging-address=0.0.0.0",
+            ]),
+            "cdp_mask": 1,
         },
+        headers=_api_headers(),
         timeout=30,
     )
     resp.raise_for_status()
@@ -168,7 +180,13 @@ def _start_profile(profile_id: str) -> tuple[str, Optional[subprocess.Popen]]:
             f"{data.get('msg', 'unknown error')}"
         )
 
-    ws_url = data["data"]["ws"]["puppeteer"]
+    ws_url = (data.get("data", {}).get("ws", {}).get("puppeteer") or "").strip()
+    if not ws_url:
+        raise RuntimeError(
+            f"AdsPower returned empty CDP URL for profile {profile_id}. "
+            "The browser started but did not expose a debug port. "
+            "Check that AdsPower is updated and the profile is not corrupted."
+        )
     port = urlparse(ws_url).port
     proxy_proc = _start_cdp_proxy(port) if port else None
 
