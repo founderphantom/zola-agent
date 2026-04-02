@@ -1,7 +1,7 @@
 ---
 name: real-estate-assistant
 description: Post and manage real estate listings on Facebook Marketplace via Telegram. Handles multiple FB accounts via AdsPower anti-detect browser profiles, bulk posting from portal links (realmmlp.ca) and Kijiji, property photos, voice memos, listing creation, tenant message replies, and comparable property research.
-version: 4.0.0
+version: 4.0.1
 author: Phantom Systems Inc
 license: MIT
 platforms: [linux]
@@ -241,44 +241,55 @@ If the operator doesn't specify target accounts, ask before proceeding.
 
 ### Step 3A — Extract Listings from Portal Link (realmmlp.ca)
 
-#### Text extraction:
+**Portal pages are JavaScript SPAs — `web_extract_tool` will NOT work.** Always use `adspower_browse` to navigate the portal and extract BOTH listing details AND photo URLs in the browser.
 
-```
-web_extract_tool(
-  urls=["<portal_url>"],
-  format="markdown"
-)
-```
+#### Extract all listing details and photos via browser:
 
-Parse the extracted content to identify individual listings. For each listing, extract:
-- Address (street, city, province, postal code)
-- Price (monthly rent or sale price)
-- Property type (house, apartment, condo, townhouse)
-- Listing type (for rent / for sale)
-- Bedrooms / Bathrooms
-- Square footage
-- Description / key features
-- MLS number (if present)
+Use any available account to browse the portal. This is a two-phase process:
 
-#### Photo extraction:
-
-Use any available account to browse the portal and collect photo URLs:
+**Phase 1 — Get the listing overview** (addresses, prices, basic details):
 
 ```
 adspower_browse(
   account_name="<any_account>",
-  task="Navigate to <portal_url>. This page contains multiple property listings. For EACH property on the page:
-  1. Click into the listing to view its photo gallery
-  2. Identify up to 10 photos, prioritizing in this order: kitchen, living room, bathroom, master bedroom, exterior/front of house, other bedrooms, backyard/patio, laundry area, parking, any other notable photos
-  3. For each photo, note the full image URL (right-click → Copy image address)
-  4. Go back to the main list and repeat for the next property
+  task="Navigate to <portal_url>. This is a real estate portal with multiple property listings. Do NOT ask the user for details — the page is public and loads without login.
 
-  Return a structured list mapping each property address to its photo URLs.",
-  max_steps=100
+  Look at each property card/tile on the page. For EACH listing, extract:
+  - Full address (street, city, province, postal code)
+  - Price (monthly rent or sale price)
+  - Property type (house, apartment, condo, townhouse)
+  - Bedrooms / Bathrooms
+  - Square footage (if shown)
+  - MLS number (if shown)
+  - Any summary description visible
+
+  Return a numbered list of all properties with their details.",
+  max_steps=40
 )
 ```
 
-After extraction, call `adspower_close` on the account used.
+**Phase 2 — Click into each listing for full details and photos:**
+
+For each listing found in Phase 1, click into it to get the full description and photo URLs:
+
+```
+adspower_browse(
+  account_name="<any_account>",
+  task="Navigate to <portal_url>. Click into listing #[N] ([address]).
+
+  1. Read the full property description, amenities, and any details not visible on the overview page
+  2. Open the photo gallery
+  3. Identify up to 10 photos, prioritizing in this order: kitchen, living room, bathroom, master bedroom, exterior/front of house, other bedrooms, backyard/patio, laundry area, parking, any other notable photos
+  4. For each photo, note the full image URL (right-click → Copy image address)
+
+  Return the full listing details AND all photo URLs for this property.",
+  max_steps=60
+)
+```
+
+Repeat Phase 2 for each listing. After extracting all listings, call `adspower_close` on the account used.
+
+**Do NOT ask the operator to provide listing details manually.** The portal is publicly accessible — the browser agent must extract everything itself.
 
 #### Fill missing fields:
 
@@ -289,23 +300,22 @@ If the portal listing is missing fields that Facebook Marketplace requires (e.g.
 
 ### Step 3B — Extract Listing from Kijiji Link
 
-#### Text extraction:
-
-```
-web_extract_tool(
-  urls=["<kijiji_url>"],
-  format="markdown"
-)
-```
-
-Parse: address, price, beds/baths, sqft, description, listing type, any amenities.
-
-#### Photo extraction:
+**Use `adspower_browse` to extract both details and photos from Kijiji.** Kijiji pages are dynamic and `web_extract_tool` may miss key data.
 
 ```
 adspower_browse(
   account_name="<any_account>",
-  task="Navigate to <kijiji_url>. Open the photo gallery for this listing. List the URLs of up to 10 photos, prioritizing: kitchen, living room, bathroom, bedroom, exterior. For each photo, right-click and copy the image URL. Return all image URLs.",
+  task="Navigate to <kijiji_url>. This is a Kijiji property listing. Extract ALL of the following:
+
+  1. Full address (street, city, province, postal code)
+  2. Price (monthly rent or sale price)
+  3. Property type (house, apartment, condo, townhouse)
+  4. Bedrooms / Bathrooms
+  5. Square footage
+  6. Full description text and amenities
+  7. Open the photo gallery and collect up to 10 photo URLs (right-click → Copy image address), prioritizing: kitchen, living room, bathroom, bedroom, exterior
+
+  Return all listing details AND photo URLs.",
   max_steps=60
 )
 ```
@@ -393,29 +403,44 @@ Reply YES to begin, or tell me what to change.
 
 **Do NOT call `adspower_browse` for any posting until the operator replies YES.**
 
+### Step 5.5 — Download Photos to Windows (once, before posting begins)
+
+**Do this ONCE after operator confirms, before any posting starts.** Use any available account to download all photos for all listings. Do NOT re-download photos for each profile — download once and reuse.
+
+For **portal/Kijiji sources**: download all listing photos to Windows Downloads, organized by listing number:
+
+```
+adspower_browse(
+  account_name="<any_account>",
+  task="Download listing photos to the Windows Downloads folder. For each image URL below, open it in a new tab, right-click the image, click 'Save image as...', save with the filename shown, then close the tab.
+
+  Listing 1 photos:
+  listing_1_photo_1.jpg → [url1]
+  listing_1_photo_2.jpg → [url2]
+  ...
+  Listing 2 photos:
+  listing_2_photo_1.jpg → [url1]
+  listing_2_photo_2.jpg → [url2]
+  ...
+
+  Report which files were saved successfully.",
+  max_steps=100
+)
+```
+
+After downloading, call `adspower_close` on the account used.
+
+**If photo download fails for any listing**: Pause and notify the operator. Facebook Marketplace requires at least 1 photo — do NOT attempt to post without photos. Wait for operator to resolve the issue before proceeding with the posting queue.
+
+For **Telegram photos** (Step 3C): skip this step — photos are already on disk. Use the WSL UNC paths directly in the file upload dialog.
+
+The downloaded photos on Windows Downloads will be reused across all profiles. Each profile will select them in a **different shuffled order** (see Step 4, rule 3).
+
 ### Step 6 — Execute Posting Queue
 
 For each post in the scrambled queue:
 
-#### 6a. Download Photos to Windows (portal/Kijiji sources only)
-
-```
-adspower_browse(
-  account_name="<target_account>",
-  task="Download listing photos to the Windows Downloads folder. For each of these image URLs, open the URL in a new tab, right-click the image, click 'Save image as...', save to Downloads as 'listing_[N]_photo_[M].jpg', then close the tab:
-  [url1]
-  [url2]
-  ...
-  Report which files were saved successfully.",
-  max_steps=80
-)
-```
-
-**If photo download fails**: Pause and notify the operator. Facebook Marketplace requires at least 1 photo — do NOT attempt to post without photos. Wait for operator to resolve the issue (manual download, alternative photo source, etc.).
-
-For **Telegram photos** (Step 3C): skip this step — photos are already on disk. Use the WSL UNC paths directly in the file upload dialog.
-
-#### 6b. Create and Publish the Listing
+#### 6a. Create and Publish the Listing
 
 ```
 adspower_browse(
@@ -429,9 +454,8 @@ adspower_browse(
   - Square footage: [sqft]
   - Description: [VARIED description for THIS account — see below]
 
-  For photos: click the photo upload area. In the file dialog, navigate to [C:\Users\<user>\Downloads] (or [\\wsl.localhost\Ubuntu\...] for Telegram photos) and select these files IN THIS ORDER (shuffled for this account):
-  [photo_file_1.jpg]
-  [photo_file_2.jpg]
+  For photos: click the photo upload area. In the file dialog, navigate to [C:\Users\<user>\Downloads] (or [\\wsl.localhost\Ubuntu\...] for Telegram photos) and select the pre-downloaded photos for this listing IN THIS ORDER (shuffled differently for this account):
+  [listing_N_photo_X.jpg]  (shuffled order — e.g., photo 3, 1, 5, 2, 4...)
   ...
 
   After filling all fields and uploading photos, click Publish/Post.
@@ -442,7 +466,7 @@ adspower_browse(
 
 **If photo upload fails after 2 attempts**: Pause and notify the operator. Do NOT publish without photos. Wait for the operator to manually upload photos or provide alternative files.
 
-#### 6c. Report Progress
+#### 6b. Report Progress
 
 After each successful post:
 
@@ -452,7 +476,7 @@ After each successful post:
 ⏭️ Next: [listing] on [account] in ~[X] minutes
 ```
 
-#### 6d. Close Session and Wait
+#### 6c. Close Session and Wait
 
 1. Call `adspower_close(account_name="<target_account>")`
 2. If the next post is on a **different profile**: proceed immediately (the 30-min rule is per-profile)
