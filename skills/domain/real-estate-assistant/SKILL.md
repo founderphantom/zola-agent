@@ -35,7 +35,16 @@ If `adspower_browse` does not appear in your tool list, the fix is an environmen
 | `adspower_download_photos` | Download images from URLs to a Windows-accessible directory. Returns Windows file paths. | After extracting photo URLs from portal/Kijiji, before posting to FB Marketplace |
 | `adspower_close` | Close a browser session | Always call this when a session is complete |
 
-**These five tools are the ONLY correct way to interact with Facebook Marketplace.** Do not attempt any other approach.
+**These five tools are the ONLY correct way to interact with websites for this skill.**
+
+**CRITICAL: NEVER use these alternative tools for ANY step in this workflow:**
+- ❌ `browser_navigate` / `navigate` — Do NOT use CamoFox, Playwright, or any other browser
+- ❌ `web_extract` / `web_extract_tool` — Cannot render JavaScript portals
+- ❌ `execute_code` / Python requests/BeautifulSoup — Portal requires browser rendering
+- ❌ `agent-browser` / `npx playwright` — Do NOT install or use local browsers
+- ❌ Web search as a substitute for portal extraction
+
+**If `adspower_browse` fails, STOP and report the exact error to the operator.** Do NOT fall back to other tools. The operator needs to fix the AdsPower/CDP connection first.
 
 ## Pre-Flight Check (run before any browser task)
 
