@@ -321,20 +321,28 @@ async def _run_browser_task(
     # When file_paths are provided, register a custom upload_file tool and
     # pass the paths via custom_context so the agent can upload files
     # programmatically through CDP (no native file-picker dialogs).
+    #
+    # file_paths contains WINDOWS paths (e.g. C:\Users\...) because Chrome
+    # on Windows needs them for DOM.setFileInputFiles.  We also build a
+    # win→wsl mapping so the upload tool can validate with os.path.exists()
+    # on the WSL side.
     agent_kwargs: dict = {}
     effective_task = task
     if file_paths:
-        agent_kwargs["tools"] = _build_upload_tools()
+        win_to_wsl = {fp: _windows_to_wsl_path(fp) for fp in file_paths}
+        agent_kwargs["tools"] = _build_upload_tools(win_to_wsl=win_to_wsl)
         agent_kwargs["custom_context"] = {
             "available_file_paths": file_paths,
         }
         file_list = "\n".join(f"  - {p}" for p in file_paths)
         effective_task = (
             f"{task}\n\n"
-            f"Available files for upload — use the upload_file tool to upload "
-            f"these to any file input element (click the photo/file upload area "
-            f"first to reveal the <input type='file'>, then call upload_file "
-            f"with the element index and file path):\n{file_list}"
+            f"IMPORTANT: To upload photos, you MUST use the upload_file tool. "
+            f"Do NOT try to use a native file picker or drag-and-drop. Steps:\n"
+            f"1. Click the photo/file upload area to reveal the <input type='file'> element.\n"
+            f"2. Call upload_file(index=<element_index>, path=<file_path>) for each file.\n"
+            f"3. The element index is the number shown next to the file input in the DOM.\n\n"
+            f"Available files for upload:\n{file_list}"
         )
 
     browser = Browser(cdp_url=cdp_url)
