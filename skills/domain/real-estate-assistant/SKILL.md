@@ -31,7 +31,7 @@ If `adspower_browse` does not appear in your tool list, the fix is an environmen
 |------|---------|-------------|
 | `adspower_sync` | Pull all profiles from AdsPower API → `~/.hermes/adspower_accounts.json` | Once on setup, or when operator adds new accounts |
 | `adspower_list_accounts` | Show all configured accounts and which are currently open | Before every session to confirm the right account |
-| `adspower_browse` | Launch a profile and run a natural-language browser task. Accepts optional `file_paths` for photo uploads. | Any time you need to interact with Facebook |
+| `adspower_browse` | Launch a profile and run a natural-language browser task. When `file_paths` is provided, the browser agent gets a custom `upload_file` tool that uploads files via CDP — no native file dialog needed. | Any time you need to interact with Facebook |
 | `adspower_download_photos` | Download images from URLs to a Windows-accessible directory. Returns Windows file paths. | After extracting photo URLs from portal/Kijiji, before posting to FB Marketplace |
 | `adspower_close` | Close a browser session | Always call this when a session is complete |
 
@@ -461,7 +461,7 @@ For each post in the scrambled queue:
 
 #### 6a. Create and Publish the Listing
 
-Pass the downloaded file paths via the `file_paths` parameter — the browser agent will use them automatically when it encounters the photo upload area:
+Pass the downloaded file paths via the `file_paths` parameter. The browser agent has a custom `upload_file` tool that uploads files programmatically via CDP (no native file dialog). Instruct it to use that tool:
 
 ```
 adspower_browse(
@@ -475,9 +475,13 @@ adspower_browse(
   - Square footage: [sqft]
   - Description: [VARIED description for THIS account — see below]
 
-  Upload photos by clicking the photo upload area and using the available files listed below.
+  To upload photos:
+  1. Click the photo upload area / 'Add photos' button to reveal the file input.
+  2. For EACH photo, use the upload_file tool with the element index of the
+     <input type='file'> element and the file path from the available files list.
+  3. Do NOT try to use a native file picker dialog — always use the upload_file tool.
 
-  After filling all fields and uploading photos, click Publish/Post.
+  After filling all fields and uploading all photos, click Publish/Post.
   Confirm the listing was posted by looking for a success message or redirect.",
   file_paths=[
     "C:\\Users\\Jamaal\\Downloads\\listing_photos\\listing_N_photo_3.jpg",
@@ -488,6 +492,8 @@ adspower_browse(
   max_steps=80
 )
 ```
+
+**How `upload_file` works under the hood**: When `file_paths` is passed to `adspower_browse`, the browser-use agent receives a custom `upload_file(index, path)` tool that dispatches a CDP `UploadFileEvent`. This sets files on `<input type="file">` elements via `DOM.setFileInputFiles` — completely bypassing the native OS file picker dialog. The agent just needs to find the file input element index and call the tool.
 
 **Shuffle the `file_paths` order differently for each profile** — don't use the same photo sequence across accounts.
 
@@ -580,11 +586,11 @@ If logged out or checkpointed, **stop and notify the operator immediately**. Do 
 | AdsPower API not reachable | Check AdsPower is open on Windows. Verify `ADSPOWER_API_URL=http://172.22.0.1:50326`. |
 | Browser task times out | Increase `max_steps` to 80-100. Facebook can be slow. |
 | Form field won't fill | Rephrase the task with more specific element descriptions |
-| Photo upload fails | Notify operator. Suggest manual upload as fallback. |
+| Photo upload fails | The `upload_file` tool may not find the `<input type="file">` element. Tell the browser agent to click the photo area first, then look for the file input. If it still fails after 2 attempts, notify operator for manual upload. |
 | "Something went wrong" | Call `adspower_browse` again with task "take a screenshot and describe what you see on the page" |
 | Account locked or suspended | Notify operator immediately. Do NOT attempt to unlock or log in. |
 | Portal page requires login | Use `adspower_browse` to navigate the portal (some portals need auth). Ask operator for credentials if needed. |
-| Photo download fails in browser | Pause and notify operator. List which listings need photos. Operator must upload manually before the listing can be posted. |
+| Photo download fails (`adspower_download_photos` errors) | Pause and notify operator. List which listings need photos. Operator must upload manually before the listing can be posted. |
 | Profile_id not found in accounts | Call `adspower_sync` to refresh from AdsPower API. If still not found, ask operator to verify the ID in AdsPower. |
 | Bulk posting interrupted mid-queue | Track completed posts in memory. On resume, skip already-posted listings. Report which posts were completed and which remain. |
 | WSL path not accessible from Windows | Try `\\wsl.localhost\Ubuntu\` path prefix. If that fails, try `\\wsl$\Ubuntu\`. Ask operator for their WSL distro name if neither works. |

@@ -248,6 +248,48 @@ def _resolve_account(account_name: Optional[str]) -> Dict[str, Any]:
 # browser-use integration
 # ---------------------------------------------------------------------------
 
+def _build_upload_tools():
+    """Build browser-use Tools registry with a programmatic file-upload action.
+
+    Uses CDP's DOM.setFileInputFiles via browser-use's UploadFileEvent so the
+    agent never has to interact with native OS file-picker dialogs.
+    """
+    from browser_use import Tools, ActionResult, BrowserSession
+
+    tools = Tools()
+
+    @tools.action("Upload file to interactive element with file path")
+    async def upload_file(
+        index: int,
+        path: str,
+        browser_session: BrowserSession,
+        available_file_paths: list[str],
+    ) -> ActionResult:
+        if path not in available_file_paths:
+            return ActionResult(error=f"File path {path} is not in available_file_paths")
+
+        if not os.path.exists(path):
+            return ActionResult(error=f"File {path} does not exist on disk")
+
+        dom_element = await browser_session.get_dom_element_by_index(index)
+        if dom_element is None:
+            return ActionResult(error=f"No element found at index {index}")
+
+        from browser_use.browser.events import UploadFileEvent
+
+        event = browser_session.event_bus.dispatch(
+            UploadFileEvent(node=dom_element, file_path=path)
+        )
+        await event
+
+        return ActionResult(
+            extracted_content=f"Successfully uploaded {os.path.basename(path)} to element at index {index}",
+            include_in_memory=True,
+        )
+
+    return tools
+
+
 async def _run_browser_task(
     cdp_url: str, task: str, max_steps: int,
     file_paths: Optional[list] = None,
@@ -261,18 +303,29 @@ async def _run_browser_task(
         api_key=os.getenv("OPENROUTER_API_KEY"),
     )
 
-    # If file_paths provided, append to task so the agent knows about them
+    # When file_paths are provided, register a custom upload_file tool and
+    # pass the paths via custom_context so the agent can upload files
+    # programmatically through CDP (no native file-picker dialogs).
+    agent_kwargs: dict = {}
     effective_task = task
     if file_paths:
+        agent_kwargs["tools"] = _build_upload_tools()
+        agent_kwargs["custom_context"] = {
+            "available_file_paths": file_paths,
+        }
         file_list = "\n".join(f"  - {p}" for p in file_paths)
         effective_task = (
             f"{task}\n\n"
-            f"Available files for upload (use these when you encounter a file "
-            f"input or photo upload area):\n{file_list}"
+            f"Available files for upload — use the upload_file tool to upload "
+            f"these to any file input element (click the photo/file upload area "
+            f"first to reveal the <input type='file'>, then call upload_file "
+            f"with the element index and file path):\n{file_list}"
         )
 
     browser = Browser(cdp_url=cdp_url)
-    agent = Agent(task=effective_task, llm=llm, browser=browser)
+    agent = Agent(
+        task=effective_task, llm=llm, browser=browser, **agent_kwargs
+    )
     result = await agent.run(max_steps=max_steps)
 
     extracted = ""
