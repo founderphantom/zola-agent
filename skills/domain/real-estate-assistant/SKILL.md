@@ -1,7 +1,7 @@
 ---
 name: real-estate-assistant
-description: Post and manage real estate listings on Facebook Marketplace via Telegram. Handles multiple FB accounts via AdsPower anti-detect browser profiles, property photos, voice memos, listing creation, tenant message replies, and comparable property research.
-version: 3.0.0
+description: Post and manage real estate listings on Facebook Marketplace via Telegram. Handles multiple FB accounts via AdsPower anti-detect browser profiles, bulk posting from portal links (realmmlp.ca) and Kijiji, property photos, voice memos, listing creation, tenant message replies, and comparable property research.
+version: 4.0.0
 author: Phantom Systems Inc
 license: MIT
 platforms: [linux]
@@ -203,6 +203,286 @@ Call `adspower_close` when done.
 
 ---
 
+## Workflow 4: Bulk Post Listings from External Sources
+
+This workflow handles posting multiple listings from external URLs (portal links, Kijiji) or Telegram photo albums to Facebook Marketplace across one or more AdsPower profiles. It extracts listing details and photos, builds a scrambled posting queue, and executes autonomously after a single operator confirmation.
+
+### Step 1 — Identify Input Type
+
+Parse the operator's message to determine the source:
+
+| Pattern | Input Method | Expected Listings |
+|---------|-------------|-------------------|
+| URL contains `realmmlp.ca` or `realtor.ca` | **A — Portal Link** | Multiple (1-10+) |
+| URL contains `kijiji.ca` | **B — Kijiji Link** | Usually 1 |
+| No URL + photos attached + property details in text | **C — Telegram Photos** | 1 |
+
+Also extract from the message:
+- **Target accounts**: profile_ids (e.g., "k1axcmjk") or account names (e.g., "Account 1")
+- **Any special instructions**: price adjustments, description overrides, etc.
+
+If the operator doesn't specify target accounts, ask before proceeding.
+
+### Step 2 — Resolve Target Accounts
+
+1. Call `adspower_list_accounts`
+2. Build a map of `{profile_id → account_name}` from the result
+3. If operator gave **profile_ids**: look up each in the map to find the `account_name`
+   - If not found: call `adspower_sync` to refresh from AdsPower API, then retry
+   - If still not found: ask operator to verify the ID in AdsPower
+4. If operator gave **account names**: use directly
+5. Confirm with operator:
+   ```
+   Resolved accounts:
+   - Account 1 (profile: k1axcmjk)
+   - Account 2 (profile: k1axdj0p)
+   Correct?
+   ```
+
+### Step 3A — Extract Listings from Portal Link (realmmlp.ca)
+
+#### Text extraction:
+
+```
+web_extract_tool(
+  urls=["<portal_url>"],
+  format="markdown"
+)
+```
+
+Parse the extracted content to identify individual listings. For each listing, extract:
+- Address (street, city, province, postal code)
+- Price (monthly rent or sale price)
+- Property type (house, apartment, condo, townhouse)
+- Listing type (for rent / for sale)
+- Bedrooms / Bathrooms
+- Square footage
+- Description / key features
+- MLS number (if present)
+
+#### Photo extraction:
+
+Use any available account to browse the portal and collect photo URLs:
+
+```
+adspower_browse(
+  account_name="<any_account>",
+  task="Navigate to <portal_url>. This page contains multiple property listings. For EACH property on the page:
+  1. Click into the listing to view its photo gallery
+  2. Identify up to 10 photos, prioritizing in this order: kitchen, living room, bathroom, master bedroom, exterior/front of house, other bedrooms, backyard/patio, laundry area, parking, any other notable photos
+  3. For each photo, note the full image URL (right-click → Copy image address)
+  4. Go back to the main list and repeat for the next property
+
+  Return a structured list mapping each property address to its photo URLs.",
+  max_steps=100
+)
+```
+
+After extraction, call `adspower_close` on the account used.
+
+#### Fill missing fields:
+
+If the portal listing is missing fields that Facebook Marketplace requires (e.g., square footage, detailed description), fill them using best judgment:
+- Estimate sqft from bed/bath count and property type if not provided
+- Write a compelling description from the available details
+- Default listing type to "for rent" unless clearly indicated otherwise
+
+### Step 3B — Extract Listing from Kijiji Link
+
+#### Text extraction:
+
+```
+web_extract_tool(
+  urls=["<kijiji_url>"],
+  format="markdown"
+)
+```
+
+Parse: address, price, beds/baths, sqft, description, listing type, any amenities.
+
+#### Photo extraction:
+
+```
+adspower_browse(
+  account_name="<any_account>",
+  task="Navigate to <kijiji_url>. Open the photo gallery for this listing. List the URLs of up to 10 photos, prioritizing: kitchen, living room, bathroom, bedroom, exterior. For each photo, right-click and copy the image URL. Return all image URLs.",
+  max_steps=60
+)
+```
+
+After extraction, call `adspower_close` on the account used.
+
+### Step 3C — Receive Listing from Telegram Photos
+
+1. Photos arrive in `media_urls` as local file paths (e.g., `/home/jamaal/.hermes/cache/images/img_abc123.jpg`)
+2. Convert each path to a Windows-accessible UNC path for the browser file dialog:
+   - Primary: `\\wsl.localhost\Ubuntu\home\jamaal\.hermes\cache\images\img_abc123.jpg`
+   - Fallback: `\\wsl$\Ubuntu\home\jamaal\.hermes\cache\images\img_abc123.jpg`
+3. Parse property details from the accompanying text message
+4. If any required field is missing (address, price, beds/baths), ask the operator before proceeding
+
+### Step 4 — Build Posting Queue (Scrambled Order)
+
+**CRITICAL: Do not post listings in sequential order. Scramble the queue to avoid pattern detection.**
+
+1. Build the full matrix: N listings x M profiles = total posts
+2. **Scramble the order** using these rules:
+   - Never post the same listing on consecutive turns
+   - Never post to the same profile on consecutive turns (when possible)
+   - Spread each listing's appearances across the timeline
+
+   **Example** — 3 listings (L1, L2, L3) x 2 profiles (A, B) = 6 posts:
+   ```
+   Turn 1: L1 on Profile A
+   Turn 2: L3 on Profile B   (different listing, different profile)
+   Turn 3: L2 on Profile A   (different listing, 30+ min since Turn 1 on A)
+   Turn 4: L1 on Profile B   (different listing from Turn 3, 30+ min since Turn 2 on B)
+   Turn 5: L3 on Profile A   (different listing, 30+ min since Turn 3 on A)
+   Turn 6: L2 on Profile B   (different listing, 30+ min since Turn 4 on B)
+   ```
+
+3. **Photo order variation**: For each profile, shuffle the photo sequence differently
+   - Profile A might show: kitchen, bedroom, living room, bathroom, exterior
+   - Profile B might show: exterior, kitchen, bathroom, living room, bedroom
+
+4. **Description variation**: For each profile, generate a different description:
+   - Profile A: formal tone, lead with location/neighborhood, different adjectives
+   - Profile B: conversational tone, lead with features/amenities, different adjectives
+   - Never copy the source description verbatim
+   - Change word choice: spacious→roomy, modern→updated, bright→sun-filled, cozy→intimate
+
+5. **Apply anti-detection constraints**:
+   - Max 3 listings per account per day
+   - 30+ minute gap between posts on the SAME profile
+   - If the queue would exceed 3 per account/day, split into Day 1 / Day 2 batches and tell the operator
+
+6. Calculate estimated total time and show in the confirmation
+
+### Step 5 — Present Plan and Get Confirmation
+
+Send the full posting plan to the operator via Telegram:
+
+```
+📋 Bulk Posting Plan
+
+Source: [portal URL / Kijiji URL / Telegram photos]
+Listings found: [N]
+Target accounts: [Account 1 (k1axcmjk), Account 2 (k1axdj0p)]
+Total posts: [N x M]
+
+Listings:
+1. [address] — $[price]/mo — [beds]BR/[baths]BA
+2. [address] — $[price]/mo — [beds]BR/[baths]BA
+3. [address] — $[price]/mo — [beds]BR/[baths]BA
+...
+
+Posting schedule (scrambled):
+  1. L1 → Account 1       (start)
+  2. L3 → Account 2       (+2 min)
+  3. L2 → Account 1       (+30 min after #1)
+  4. L1 → Account 2       (+30 min after #2)
+  5. L3 → Account 1       (+30 min after #3)
+  6. L2 → Account 2       (+30 min after #4)
+
+Estimated time: [X hours Y minutes]
+
+⚠️ [any warnings: exceeds daily limit, missing photos for listing N, etc.]
+
+Reply YES to begin, or tell me what to change.
+```
+
+**Do NOT call `adspower_browse` for any posting until the operator replies YES.**
+
+### Step 6 — Execute Posting Queue
+
+For each post in the scrambled queue:
+
+#### 6a. Download Photos to Windows (portal/Kijiji sources only)
+
+```
+adspower_browse(
+  account_name="<target_account>",
+  task="Download listing photos to the Windows Downloads folder. For each of these image URLs, open the URL in a new tab, right-click the image, click 'Save image as...', save to Downloads as 'listing_[N]_photo_[M].jpg', then close the tab:
+  [url1]
+  [url2]
+  ...
+  Report which files were saved successfully.",
+  max_steps=80
+)
+```
+
+**If photo download fails**: Pause and notify the operator. Facebook Marketplace requires at least 1 photo — do NOT attempt to post without photos. Wait for operator to resolve the issue (manual download, alternative photo source, etc.).
+
+For **Telegram photos** (Step 3C): skip this step — photos are already on disk. Use the WSL UNC paths directly in the file upload dialog.
+
+#### 6b. Create and Publish the Listing
+
+```
+adspower_browse(
+  account_name="<target_account>",
+  task="Navigate to https://www.facebook.com/marketplace/create/rental and create a new listing:
+  - Property type: [type]
+  - Monthly rent: $[price]
+  - Address: [full address]
+  - Bedrooms: [beds]
+  - Bathrooms: [baths]
+  - Square footage: [sqft]
+  - Description: [VARIED description for THIS account — see below]
+
+  For photos: click the photo upload area. In the file dialog, navigate to [C:\Users\<user>\Downloads] (or [\\wsl.localhost\Ubuntu\...] for Telegram photos) and select these files IN THIS ORDER (shuffled for this account):
+  [photo_file_1.jpg]
+  [photo_file_2.jpg]
+  ...
+
+  After filling all fields and uploading photos, click Publish/Post.
+  Confirm the listing was posted by looking for a success message or redirect.",
+  max_steps=80
+)
+```
+
+**If photo upload fails after 2 attempts**: Pause and notify the operator. Do NOT publish without photos. Wait for the operator to manually upload photos or provide alternative files.
+
+#### 6c. Report Progress
+
+After each successful post:
+
+```
+✅ Posted [current]/[total]: [address] on [account_name]
+📸 [X] photos uploaded
+⏭️ Next: [listing] on [account] in ~[X] minutes
+```
+
+#### 6d. Close Session and Wait
+
+1. Call `adspower_close(account_name="<target_account>")`
+2. If the next post is on a **different profile**: proceed immediately (the 30-min rule is per-profile)
+3. If the next post is on the **same profile**: wait 30+ minutes before the next post
+4. Between posts, the agent can post to other profiles if the schedule allows
+
+### Step 7 — Final Report
+
+When the queue is complete (or if unrecoverable errors stop the queue):
+
+```
+📊 Bulk Posting Complete
+
+✅ Succeeded: [N] / [total]
+❌ Failed: [M] / [total]
+
+Per-listing breakdown:
+  [address 1]: ✅ Account 1, ✅ Account 2
+  [address 2]: ✅ Account 1, ❌ Account 2 (photo upload failed)
+  [address 3]: ✅ Account 1, ✅ Account 2
+
+[If any failed]:
+Failed posts:
+  - [address] on [account]: [reason]
+
+Want me to retry the failed posts?
+```
+
+---
+
 ## Session Health Check
 
 Before any Facebook operation on an account, verify it is still logged in:
@@ -222,11 +502,16 @@ If logged out or checkpointed, **stop and notify the operator immediately**. Do 
 ## Anti-Detection Rules
 
 - Max **3 listings per account per day**
-- Space listings **30+ minutes apart**
+- Space listings **30+ minutes apart** on the same account
 - Never post identical listing text on multiple accounts — vary the descriptions
 - If you see a CAPTCHA or "suspicious activity" warning, **stop immediately** and notify operator
 - Never navigate to Facebook settings, privacy, or account pages unless explicitly asked
 - **Always call `adspower_close` when done** — zombie browsers waste RAM and may trigger detection
+- When bulk posting, **scramble the posting order** — don't post listings sequentially or the same listing back-to-back on different profiles
+- **Shuffle photo order per profile** — don't upload photos in the same sequence across accounts
+- **Vary descriptions per profile** — change tone, word choice, feature ordering, adjectives (spacious vs roomy, modern vs updated, bright vs sun-filled)
+- If a bulk queue exceeds 3 listings per account in one day, **split across days** and notify the operator
+- Track posting timestamps per account in memory to enforce spacing across sessions
 
 ---
 
@@ -243,6 +528,12 @@ If logged out or checkpointed, **stop and notify the operator immediately**. Do 
 | Photo upload fails | Notify operator. Suggest manual upload as fallback. |
 | "Something went wrong" | Call `adspower_browse` again with task "take a screenshot and describe what you see on the page" |
 | Account locked or suspended | Notify operator immediately. Do NOT attempt to unlock or log in. |
+| Portal page requires login | Use `adspower_browse` to navigate the portal (some portals need auth). Ask operator for credentials if needed. |
+| Photo download fails in browser | Pause and notify operator. List which listings need photos. Operator must upload manually before the listing can be posted. |
+| Profile_id not found in accounts | Call `adspower_sync` to refresh from AdsPower API. If still not found, ask operator to verify the ID in AdsPower. |
+| Bulk posting interrupted mid-queue | Track completed posts in memory. On resume, skip already-posted listings. Report which posts were completed and which remain. |
+| WSL path not accessible from Windows | Try `\\wsl.localhost\Ubuntu\` path prefix. If that fails, try `\\wsl$\Ubuntu\`. Ask operator for their WSL distro name if neither works. |
+| Kijiji/portal structure changed | Use `adspower_browse` with vision to manually inspect the page. Update extraction approach. Save new pattern to memory. |
 
 ---
 
@@ -253,5 +544,10 @@ Save useful knowledge to memory as you work:
 - Task descriptions that reliably complete specific actions
 - Common tenant questions and effective reply templates
 - Account-specific notes (e.g. "Account 2 is phone-verified")
+- Portal page structures (realmmlp.ca listing format, Kijiji listing format) and reliable extraction patterns
+- Photo download paths that reliably work across the WSL2/Windows boundary
+- Per-account posting history (timestamps, daily counts) to enforce anti-detection across sessions
+- Description variation templates that work well for different property types
+- Posting queue schedules that have worked well (scramble patterns)
 
 When you find a better workflow or a new edge case, update this skill file.
