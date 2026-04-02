@@ -248,7 +248,10 @@ def _resolve_account(account_name: Optional[str]) -> Dict[str, Any]:
 # browser-use integration
 # ---------------------------------------------------------------------------
 
-async def _run_browser_task(cdp_url: str, task: str, max_steps: int) -> dict:
+async def _run_browser_task(
+    cdp_url: str, task: str, max_steps: int,
+    file_paths: Optional[list] = None,
+) -> dict:
     """Connect browser-use to an AdsPower CDP endpoint and run a task."""
     from browser_use import Agent, Browser
     from browser_use.llm.openrouter.chat import ChatOpenRouter
@@ -258,8 +261,18 @@ async def _run_browser_task(cdp_url: str, task: str, max_steps: int) -> dict:
         api_key=os.getenv("OPENROUTER_API_KEY"),
     )
 
+    # If file_paths provided, append to task so the agent knows about them
+    effective_task = task
+    if file_paths:
+        file_list = "\n".join(f"  - {p}" for p in file_paths)
+        effective_task = (
+            f"{task}\n\n"
+            f"Available files for upload (use these when you encounter a file "
+            f"input or photo upload area):\n{file_list}"
+        )
+
     browser = Browser(cdp_url=cdp_url)
-    agent = Agent(task=task, llm=llm, browser=browser)
+    agent = Agent(task=effective_task, llm=llm, browser=browser)
     result = await agent.run(max_steps=max_steps)
 
     extracted = ""
@@ -384,6 +397,7 @@ def _handle_browse(args: dict, **kw) -> str:
     account_name = args.get("account_name", "")
     task = args.get("task", "")
     max_steps = args.get("max_steps", 50)
+    file_paths = args.get("file_paths", [])
 
     if not account_name:
         return json.dumps({"success": False, "error": "account_name is required"})
@@ -436,7 +450,9 @@ def _handle_browse(args: dict, **kw) -> str:
 
     # Run browser-use Agent
     try:
-        result = _run_async(_run_browser_task(ws_url, task, max_steps))
+        result = _run_async(_run_browser_task(
+            ws_url, task, max_steps, file_paths=file_paths or None,
+        ))
         return json.dumps({
             "success": True,
             "account": account_name,
@@ -479,6 +495,67 @@ def _handle_close(args: dict, **kw) -> str:
             "closed": [],
         })
     return json.dumps({"success": True, "closed": closed})
+
+
+def _detect_windows_downloads() -> Path:
+    """Detect the Windows Downloads folder accessible from WSL2."""
+    mnt_users = Path("/mnt/c/Users")
+    if mnt_users.exists():
+        for entry in mnt_users.iterdir():
+            if entry.is_dir() and entry.name not in ("Public", "Default", "Default User", "All Users"):
+                downloads = entry / "Downloads" / "listing_photos"
+                return downloads
+    # Fallback to hermes cache
+    return _get_hermes_home() / "cache" / "listing_photos"
+
+
+def _wsl_to_windows_path(wsl_path: str) -> str:
+    """Convert a /mnt/c/... WSL path to a C:\\... Windows path."""
+    if wsl_path.startswith("/mnt/"):
+        parts = wsl_path.split("/")
+        drive = parts[2].upper()
+        rest = "\\".join(parts[3:])
+        return f"{drive}:\\{rest}"
+    return wsl_path
+
+
+def _handle_download_photos(args: dict, **kw) -> str:
+    """Download listing photos from URLs to a Windows-accessible directory."""
+    urls = args.get("urls", [])
+    listing_id = args.get("listing_id", "listing")
+
+    if not urls:
+        return json.dumps({"success": False, "error": "No URLs provided"})
+
+    dest_dir = _detect_windows_downloads()
+    dest_dir.mkdir(parents=True, exist_ok=True)
+
+    downloaded = []
+    failed = []
+
+    from tools.vision_tools import _download_image
+
+    for i, url in enumerate(urls, 1):
+        fname = f"{listing_id}_photo_{i}.jpg"
+        dest = dest_dir / fname
+        try:
+            _run_async(_download_image(url, dest))
+            win_path = _wsl_to_windows_path(str(dest))
+            downloaded.append({"file": fname, "wsl_path": str(dest), "windows_path": win_path})
+        except Exception as e:
+            failed.append({"url": url, "error": str(e)[:200]})
+            logger.warning("Photo download failed for %s: %s", url[:80], e)
+
+    return json.dumps({
+        "success": len(downloaded) > 0,
+        "downloaded": len(downloaded),
+        "failed": len(failed),
+        "file_paths": [d["windows_path"] for d in downloaded],
+        "wsl_paths": [d["wsl_path"] for d in downloaded],
+        "details": downloaded,
+        "errors": failed,
+        "download_dir": str(dest_dir),
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -546,8 +623,46 @@ ADSPOWER_BROWSE_SCHEMA = {
                 "description": "Maximum browser actions (default: 50)",
                 "default": 50,
             },
+            "file_paths": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "List of local file paths (Windows paths) the browser "
+                    "agent can upload to file inputs. Use paths returned by "
+                    "adspower_download_photos."
+                ),
+            },
         },
         "required": ["account_name", "task"],
+    },
+}
+
+ADSPOWER_DOWNLOAD_PHOTOS_SCHEMA = {
+    "name": "adspower_download_photos",
+    "description": (
+        "Download listing photos from URLs to a Windows-accessible directory. "
+        "Use this after extracting photo URLs from a portal or Kijiji listing "
+        "via adspower_browse. Returns Windows file paths that can be passed "
+        "to adspower_browse via the file_paths parameter for uploading to "
+        "Facebook Marketplace."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "urls": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "List of image URLs to download",
+            },
+            "listing_id": {
+                "type": "string",
+                "description": (
+                    "Identifier for the listing, used in filenames "
+                    "(e.g., 'listing_1', 'listing_2')"
+                ),
+            },
+        },
+        "required": ["urls", "listing_id"],
     },
 }
 
@@ -625,6 +740,18 @@ registry.register(
     is_async=False,
     description="Run browser task on AdsPower profile",
     emoji="🌐",
+)
+
+registry.register(
+    name="adspower_download_photos",
+    toolset="adspower",
+    schema=ADSPOWER_DOWNLOAD_PHOTOS_SCHEMA,
+    handler=_handle_download_photos,
+    check_fn=_check_adspower_api,
+    requires_env=[],
+    is_async=False,
+    description="Download listing photos to Windows directory",
+    emoji="📸",
 )
 
 registry.register(

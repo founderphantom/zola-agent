@@ -31,10 +31,11 @@ If `adspower_browse` does not appear in your tool list, the fix is an environmen
 |------|---------|-------------|
 | `adspower_sync` | Pull all profiles from AdsPower API → `~/.hermes/adspower_accounts.json` | Once on setup, or when operator adds new accounts |
 | `adspower_list_accounts` | Show all configured accounts and which are currently open | Before every session to confirm the right account |
-| `adspower_browse` | Launch a profile and run a natural-language browser task | Any time you need to interact with Facebook |
+| `adspower_browse` | Launch a profile and run a natural-language browser task. Accepts optional `file_paths` for photo uploads. | Any time you need to interact with Facebook |
+| `adspower_download_photos` | Download images from URLs to a Windows-accessible directory. Returns Windows file paths. | After extracting photo URLs from portal/Kijiji, before posting to FB Marketplace |
 | `adspower_close` | Close a browser session | Always call this when a session is complete |
 
-**These four tools are the ONLY correct way to interact with Facebook Marketplace.** Do not attempt any other approach.
+**These five tools are the ONLY correct way to interact with Facebook Marketplace.** Do not attempt any other approach.
 
 ## Pre-Flight Check (run before any browser task)
 
@@ -270,19 +271,29 @@ adspower_browse(
 
 **Phase 2 — Click into each listing for full details and photos:**
 
-For each listing found in Phase 1, click into it to get the full description and photo URLs:
+For each listing found in Phase 1, click into it to get the full description and photo URLs.
+
+**CRITICAL: Do NOT use right-click to copy image URLs — it is unreliable in browser-use. Instead, use JavaScript to extract image URLs from the page DOM.**
 
 ```
 adspower_browse(
   account_name="<any_account>",
-  task="Navigate to <portal_url>. Click into listing #[N] ([address]).
+  task="Navigate to <individual_listing_url_or_click_into_listing>.
 
-  1. Read the full property description, amenities, and any details not visible on the overview page
-  2. Open the photo gallery
-  3. Identify up to 10 photos, prioritizing in this order: kitchen, living room, bathroom, master bedroom, exterior/front of house, other bedrooms, backyard/patio, laundry area, parking, any other notable photos
-  4. For each photo, note the full image URL (right-click → Copy image address)
+  1. Read the full property description, amenities, and any details not visible on the overview page.
 
-  Return the full listing details AND all photo URLs for this property.",
+  2. Open/scroll through the photo gallery so all images load.
+
+  3. Extract photo URLs by running JavaScript in the browser console:
+     - Try: document.querySelectorAll('img[src*=\"photo\"], img[src*=\"image\"], img[src*=\"cdn\"], img[src*=\"upload\"], .gallery img, [class*=\"photo\"] img, [class*=\"gallery\"] img, [class*=\"carousel\"] img, [class*=\"slider\"] img')
+     - Collect all src attributes that look like actual listing photos (ignore logos, icons, avatars, tiny images)
+     - Filter to images wider than 300px (listing photos, not thumbnails)
+     - If that returns nothing, try: document.querySelectorAll('img') and filter by size
+     - Also check for background-image CSS: document.querySelectorAll('[style*=\"background-image\"]') and extract the URL from the style attribute
+
+  4. Select up to 10 of the best photos, prioritizing: kitchen, living room, bathroom, master bedroom, exterior/front, other bedrooms, backyard, laundry, parking. Use the alt text, filename, or surrounding context to identify room types.
+
+  Return the full listing details AND all photo URLs (as full https:// URLs, not relative paths).",
   max_steps=60
 )
 ```
@@ -313,7 +324,11 @@ adspower_browse(
   4. Bedrooms / Bathrooms
   5. Square footage
   6. Full description text and amenities
-  7. Open the photo gallery and collect up to 10 photo URLs (right-click → Copy image address), prioritizing: kitchen, living room, bathroom, bedroom, exterior
+  7. Open/scroll through the photo gallery so all images load, then extract photo URLs using JavaScript:
+     - Run: document.querySelectorAll('img') and collect src attributes
+     - Filter to actual listing photos (ignore logos, icons, thumbnails under 300px wide)
+     - Select up to 10 photos prioritizing: kitchen, living room, bathroom, bedroom, exterior
+     - Return full https:// URLs
 
   Return all listing details AND photo URLs.",
   max_steps=60
@@ -405,32 +420,36 @@ Reply YES to begin, or tell me what to change.
 
 ### Step 5.5 — Download Photos to Windows (once, before posting begins)
 
-**Do this ONCE after operator confirms, before any posting starts.** Use any available account to download all photos for all listings. Do NOT re-download photos for each profile — download once and reuse.
+**Do this ONCE after operator confirms, before any posting starts.** Download all photos for all listings using `adspower_download_photos`. Do NOT re-download for each profile — download once and reuse.
 
-For **portal/Kijiji sources**: download all listing photos to Windows Downloads, organized by listing number:
+For **each listing** extracted in Step 3A/3B, call `adspower_download_photos` with the photo URLs:
 
 ```
-adspower_browse(
-  account_name="<any_account>",
-  task="Download listing photos to the Windows Downloads folder. For each image URL below, open it in a new tab, right-click the image, click 'Save image as...', save with the filename shown, then close the tab.
-
-  Listing 1 photos:
-  listing_1_photo_1.jpg → [url1]
-  listing_1_photo_2.jpg → [url2]
-  ...
-  Listing 2 photos:
-  listing_2_photo_1.jpg → [url1]
-  listing_2_photo_2.jpg → [url2]
-  ...
-
-  Report which files were saved successfully.",
-  max_steps=100
+adspower_download_photos(
+  urls=["https://cdn.example.com/photo1.jpg", "https://cdn.example.com/photo2.jpg", ...],
+  listing_id="listing_1"
 )
 ```
 
-After downloading, call `adspower_close` on the account used.
+This downloads the images directly to a Windows-accessible directory and returns Windows file paths:
+```json
+{
+  "success": true,
+  "downloaded": 8,
+  "failed": 0,
+  "file_paths": [
+    "C:\\Users\\Jamaal\\Downloads\\listing_photos\\listing_1_photo_1.jpg",
+    "C:\\Users\\Jamaal\\Downloads\\listing_photos\\listing_1_photo_2.jpg",
+    ...
+  ]
+}
+```
 
-**If photo download fails for any listing**: Pause and notify the operator. Facebook Marketplace requires at least 1 photo — do NOT attempt to post without photos. Wait for operator to resolve the issue before proceeding with the posting queue.
+**Save the returned `file_paths`** — you will pass them to `adspower_browse` via the `file_paths` parameter when posting each listing.
+
+Repeat for each listing (listing_1, listing_2, etc.).
+
+**If download fails for any listing**: Pause and notify the operator. Facebook Marketplace requires at least 1 photo — do NOT attempt to post without photos. Wait for operator to resolve the issue before proceeding.
 
 For **Telegram photos** (Step 3C): skip this step — photos are already on disk. Use the WSL UNC paths directly in the file upload dialog.
 
@@ -441,6 +460,8 @@ The downloaded photos on Windows Downloads will be reused across all profiles. E
 For each post in the scrambled queue:
 
 #### 6a. Create and Publish the Listing
+
+Pass the downloaded file paths via the `file_paths` parameter — the browser agent will use them automatically when it encounters the photo upload area:
 
 ```
 adspower_browse(
@@ -454,15 +475,25 @@ adspower_browse(
   - Square footage: [sqft]
   - Description: [VARIED description for THIS account — see below]
 
-  For photos: click the photo upload area. In the file dialog, navigate to [C:\Users\<user>\Downloads] (or [\\wsl.localhost\Ubuntu\...] for Telegram photos) and select the pre-downloaded photos for this listing IN THIS ORDER (shuffled differently for this account):
-  [listing_N_photo_X.jpg]  (shuffled order — e.g., photo 3, 1, 5, 2, 4...)
-  ...
+  Upload photos by clicking the photo upload area and using the available files listed below.
 
   After filling all fields and uploading photos, click Publish/Post.
   Confirm the listing was posted by looking for a success message or redirect.",
+  file_paths=[
+    "C:\\Users\\Jamaal\\Downloads\\listing_photos\\listing_N_photo_3.jpg",
+    "C:\\Users\\Jamaal\\Downloads\\listing_photos\\listing_N_photo_1.jpg",
+    "C:\\Users\\Jamaal\\Downloads\\listing_photos\\listing_N_photo_5.jpg",
+    ...
+  ],
   max_steps=80
 )
 ```
+
+**Shuffle the `file_paths` order differently for each profile** — don't use the same photo sequence across accounts.
+
+For **Telegram photos** (Step 3C): convert the WSL paths to Windows UNC paths and pass them via `file_paths`:
+- WSL: `/home/jamaal/.hermes/cache/images/img_abc123.jpg`
+- Windows UNC: `\\wsl.localhost\Ubuntu\home\jamaal\.hermes\cache\images\img_abc123.jpg`
 
 **If photo upload fails after 2 attempts**: Pause and notify the operator. Do NOT publish without photos. Wait for the operator to manually upload photos or provide alternative files.
 

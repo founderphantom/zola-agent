@@ -212,7 +212,7 @@ TOOLSETS = {
 
     "adspower": {
         "description": "AdsPower anti-detect browser automation for multi-account workflows",
-        "tools": ["adspower_sync", "adspower_list_accounts", "adspower_browse", "adspower_close"],
+        "tools": ["adspower_sync", "adspower_list_accounts", "adspower_browse", "adspower_close", "adspower_download_photos"],
         "includes": []
     },
 
