@@ -253,13 +253,45 @@ async def _run_browser_task(
     file_paths: Optional[list] = None,
 ) -> dict:
     """Connect browser-use to an AdsPower CDP endpoint and run a task."""
-    from browser_use import Agent, Browser
+    from browser_use import Agent, Browser, Tools, ActionResult, BrowserSession
     from browser_use.llm.openrouter.chat import ChatOpenRouter
 
     llm = ChatOpenRouter(
         model=os.getenv("BROWSER_USE_LLM_MODEL", "moonshotai/kimi-k2.5"),
         api_key=os.getenv("OPENROUTER_API_KEY"),
     )
+
+    # -- Custom tools for handling lazy-loaded / infinite-scroll pages ------
+    # CDP synthesized scroll gestures often fail to fire the JS
+    # IntersectionObserver / scroll events that lazy-loading pages rely on.
+    # This action uses page.evaluate(window.scrollTo) which triggers those
+    # events properly, then waits for new content between each scroll.
+    tools = Tools()
+
+    @tools.action(
+        'Scroll the entire page to load all lazy-loaded content. '
+        'Call this before extracting data from pages that may have '
+        'more results below the fold.'
+    )
+    async def scroll_to_load_all(browser_session: BrowserSession) -> ActionResult:
+        page = await browser_session.must_get_current_page()
+        last_height = await page.evaluate("document.body.scrollHeight")
+        scroll_count = 0
+        while scroll_count < 50:
+            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            await page.wait_for_timeout(2000)
+            new_height = await page.evaluate("document.body.scrollHeight")
+            if new_height == last_height:
+                break
+            last_height = new_height
+            scroll_count += 1
+        await page.evaluate("window.scrollTo(0, 0)")
+        return ActionResult(
+            extracted_content=(
+                f'Scrolled {scroll_count} times to load all content. '
+                f'Page height: {last_height}px.'
+            )
+        )
 
     # browser-use 0.12.5 has a built-in upload_file action that dispatches
     # UploadFileEvent via CDP (DOM.setFileInputFiles).  It needs:
@@ -280,12 +312,20 @@ async def _run_browser_task(
             f"{file_list}"
         )
 
+    # Append a lazy-load hint so the LLM knows to scroll first
+    effective_task += (
+        "\n\nNOTE: If the page may contain more results than initially "
+        "visible (lazy-loaded / infinite-scroll content), call the "
+        "scroll_to_load_all action BEFORE extracting any data."
+    )
+
     browser = Browser(cdp_url=cdp_url)
     agent = Agent(
         task=effective_task,
         llm=llm,
         browser=browser,
         available_file_paths=file_paths or None,
+        tools=tools,
     )
     result = await agent.run(max_steps=max_steps)
 
