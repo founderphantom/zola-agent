@@ -1,7 +1,7 @@
 ---
 name: real-estate-assistant
 description: Post and manage real estate listings on Facebook Marketplace via Telegram. Handles multiple FB accounts via AdsPower anti-detect browser profiles, bulk posting from portal links (realmmlp.ca) and Kijiji, property photos, voice memos, listing creation, tenant message replies, and comparable property research.
-version: 4.0.1
+version: 4.1.0
 author: Phantom Systems Inc
 license: MIT
 platforms: [linux]
@@ -29,9 +29,9 @@ If `adspower_browse` does not appear in your tool list, the fix is an environmen
 
 | Tool | Purpose | When to use |
 |------|---------|-------------|
-| `adspower_sync` | Pull all profiles from AdsPower API → `~/.hermes/adspower_accounts.json` | Once on setup, or when operator adds new accounts |
-| `adspower_list_accounts` | Show all configured accounts and which are currently open | Before every session to confirm the right account |
-| `adspower_browse` | Launch a profile and run a natural-language browser task. When `file_paths` is provided, browser-use's built-in `upload_file` action can upload files via CDP — no native file dialog needed. | Any time you need to interact with Facebook |
+| `adspower_sync` | Pull all profiles from AdsPower API → `~/.hermes/adspower_accounts.json` (includes `custom_id` and `serial_number`) | Once on setup, or when operator adds new accounts |
+| `adspower_list_accounts` | Show all configured accounts (name, profile_id, custom_id) and which are currently open | Before every session to confirm the right account |
+| `adspower_browse` | Launch a profile and run a natural-language browser task. Accepts `account_name`, `custom_id`, or `profile_id` to identify the account. When `file_paths` is provided, browser-use's built-in `upload_file` action can upload files via CDP — no native file dialog needed. Includes a built-in `scroll_to_load_all` action for lazy-loaded pages. | Any time you need to interact with Facebook |
 | `adspower_download_photos` | Download images from URLs to a Windows-accessible directory. Returns Windows file paths. | After extracting photo URLs from portal/Kijiji, before posting to FB Marketplace |
 | `adspower_close` | Close a browser session | Always call this when a session is complete |
 
@@ -59,13 +59,13 @@ Each Facebook account maps to an AdsPower browser profile in `~/.hermes/adspower
 ```json
 {
   "accounts": [
-    { "name": "Account 1", "profile_id": "xxx", "description": "Primary listings" },
-    { "name": "Account 2", "profile_id": "yyy", "description": "Secondary listings" }
+    { "name": "Account 1", "profile_id": "xxx", "custom_id": "5", "serial_number": "1", "description": "Primary listings" },
+    { "name": "Account 2", "profile_id": "yyy", "custom_id": "22", "serial_number": "2", "description": "Secondary listings" }
   ]
 }
 ```
 
-Always confirm the account name with the operator before acting. Each profile has its own cookies, proxy, and fingerprint — **never modify AdsPower profile settings**.
+**Account lookup** accepts any of: `name`, `custom_id`, or `profile_id`. For example, `adspower_browse(account_name="5", ...)` will match the account with `custom_id: "5"`. Always confirm the account with the operator before acting. Each profile has its own cookies, proxy, and fingerprint — **never modify AdsPower profile settings**.
 
 ## How `adspower_browse` Works
 
@@ -73,13 +73,23 @@ You write a natural-language task. A browser agent (browser-use) reads the page,
 
 ```
 adspower_browse(
-  account_name="Account 1",
+  account_name="Account 1",   # also accepts custom_id (e.g. "5") or profile_id (e.g. "klaxcmjk")
   task="<what you want the browser to do, in plain English>",
   max_steps=50
 )
 ```
 
 The result contains what the browser agent extracted or observed. Use `max_steps=80` for complex multi-page tasks.
+
+### Lazy-Loaded Pages (scroll_to_load_all)
+
+The browser agent has a built-in `scroll_to_load_all` custom action. It uses JavaScript `window.scrollTo()` (which properly triggers IntersectionObserver and scroll events, unlike CDP gestures) and loops until the page height stops growing. The agent's task prompt automatically includes a hint to use this action when pages may have lazy-loaded content.
+
+For pages like realmmlp.ca portals with 50-100+ listings, the agent will call `scroll_to_load_all` first to ensure all listings are loaded before extraction. If the agent only sees a partial result set, instruct it explicitly:
+
+```
+task="First call scroll_to_load_all to load all listings on the page. Then extract all property details..."
+```
 
 ---
 
@@ -228,7 +238,7 @@ Parse the operator's message to determine the source:
 | No URL + photos attached + property details in text | **C — Telegram Photos** | 1 |
 
 Also extract from the message:
-- **Target accounts**: profile_ids (e.g., "k1axcmjk") or account names (e.g., "Account 1")
+- **Target accounts**: custom_ids (e.g., "5", "22"), profile_ids (e.g., "k1axcmjk"), or account names (e.g., "Account 1")
 - **Any special instructions**: price adjustments, description overrides, etc.
 
 If the operator doesn't specify target accounts, ask before proceeding.
@@ -236,16 +246,16 @@ If the operator doesn't specify target accounts, ask before proceeding.
 ### Step 2 — Resolve Target Accounts
 
 1. Call `adspower_list_accounts`
-2. Build a map of `{profile_id → account_name}` from the result
-3. If operator gave **profile_ids**: look up each in the map to find the `account_name`
+2. Build a map from the result — accounts can be looked up by `name`, `custom_id`, or `profile_id`
+3. If operator gave **custom_ids** (e.g., "5", "22"): pass directly to `adspower_browse` as `account_name` — the tool resolves custom_ids automatically
    - If not found: call `adspower_sync` to refresh from AdsPower API, then retry
    - If still not found: ask operator to verify the ID in AdsPower
-4. If operator gave **account names**: use directly
+4. If operator gave **profile_ids** or **account names**: pass directly — the tool accepts all three
 5. Confirm with operator:
    ```
    Resolved accounts:
-   - Account 1 (profile: k1axcmjk)
-   - Account 2 (profile: k1axdj0p)
+   - Account 1 (profile: k1axcmjk, custom_id: 5)
+   - Account 2 (profile: k1axdj0p, custom_id: 22)
    Correct?
    ```
 
@@ -264,7 +274,9 @@ adspower_browse(
   account_name="<any_account>",
   task="Navigate to <portal_url>. This is a real estate portal with multiple property listings. Do NOT ask the user for details — the page is public and loads without login.
 
-  Look at each property card/tile on the page. For EACH listing, extract:
+  FIRST: Call scroll_to_load_all to ensure ALL listings are loaded (the page may lazy-load content as you scroll — there could be 50-100+ listings).
+
+  Then look at each property card/tile on the page. For EACH listing, extract:
   - Full address (street, city, province, postal code)
   - Price (monthly rent or sale price)
   - Property type (house, apartment, condo, townhouse)
@@ -273,8 +285,8 @@ adspower_browse(
   - MLS number (if shown)
   - Any summary description visible
 
-  Return a numbered list of all properties with their details.",
-  max_steps=40
+  Return a numbered list of ALL properties with their details.",
+  max_steps=60
 )
 ```
 
@@ -588,7 +600,7 @@ If logged out or checkpointed, **stop and notify the operator immediately**. Do 
 | Problem | What to do |
 |---------|------------|
 | `adspower_browse` not in tool list | Tell operator to check `~/.hermes/.env` has `ADSPOWER_API_URL`, `ADSPOWER_API_KEY`, `OPENROUTER_API_KEY` set. Restart gateway. Do NOT use `execute_code`. |
-| "Account not found" error | Call `adspower_sync` to refresh account list, then retry |
+| "Account not found" error | Call `adspower_sync` to refresh account list (adds custom_ids), then retry. Accounts can be looked up by name, custom_id, or profile_id. |
 | CDP connection fails / timeout | The `cdp-bridge.ps1` script may not be running. Tell operator to open an admin PowerShell and run it. |
 | AdsPower API not reachable | Check AdsPower is open on Windows. Verify `ADSPOWER_API_URL=http://172.22.0.1:50326`. |
 | Browser task times out | Increase `max_steps` to 80-100. Facebook can be slow. |
@@ -598,7 +610,8 @@ If logged out or checkpointed, **stop and notify the operator immediately**. Do 
 | Account locked or suspended | Notify operator immediately. Do NOT attempt to unlock or log in. |
 | Portal page requires login | Use `adspower_browse` to navigate the portal (some portals need auth). Ask operator for credentials if needed. |
 | Photo download fails (`adspower_download_photos` errors) | Pause and notify operator. List which listings need photos. Operator must upload manually before the listing can be posted. |
-| Profile_id not found in accounts | Call `adspower_sync` to refresh from AdsPower API. If still not found, ask operator to verify the ID in AdsPower. |
+| Profile_id or custom_id not found | Call `adspower_sync` to refresh from AdsPower API (now includes custom_ids). If still not found, ask operator to verify the ID in AdsPower. |
+| Portal shows fewer listings than expected | The page uses lazy loading. The agent should call `scroll_to_load_all` first. If it still misses listings, instruct the task explicitly: "Call scroll_to_load_all before extracting data." Increase `max_steps` to 60+. |
 | Bulk posting interrupted mid-queue | Track completed posts in memory. On resume, skip already-posted listings. Report which posts were completed and which remain. |
 | WSL path not accessible from Windows | Try `\\wsl.localhost\Ubuntu\` path prefix. If that fails, try `\\wsl$\Ubuntu\`. Ask operator for their WSL distro name if neither works. |
 | Kijiji/portal structure changed | Use `adspower_browse` with vision to manually inspect the page. Update extraction approach. Save new pattern to memory. |
