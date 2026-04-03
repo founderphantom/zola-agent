@@ -383,6 +383,8 @@ def _handle_sync_accounts(args: dict, **kw) -> str:
                 all_profiles.append({
                     "name": p.get("name", p.get("serial_number", "unnamed")),
                     "profile_id": p.get("user_id", ""),
+                    "custom_id": p.get("custom_id", ""),
+                    "serial_number": p.get("serial_number", ""),
                     "description": p.get("remark", ""),
                 })
 
@@ -440,6 +442,8 @@ def _handle_list_accounts(args: dict, **kw) -> str:
             result.append({
                 "name": acct.get("name", "unnamed"),
                 "profile_id": acct.get("profile_id", ""),
+                "custom_id": acct.get("custom_id", ""),
+                "serial_number": acct.get("serial_number", ""),
                 "description": acct.get("description", ""),
                 "active": acct.get("name", "") in _active_sessions,
             })
@@ -458,28 +462,36 @@ def _handle_browse(args: dict, **kw) -> str:
     if not task:
         return json.dumps({"success": False, "error": "task is required"})
 
-    # Look up profile_id from config
+    # Look up profile_id from config — match by name, custom_id, or profile_id
     accounts = _load_accounts()
     profile_id = None
+    matched_name = account_name
     for acct in accounts:
-        if acct.get("name") == account_name:
+        if (acct.get("name") == account_name
+                or acct.get("custom_id") == account_name
+                or acct.get("profile_id") == account_name):
             profile_id = acct.get("profile_id")
+            matched_name = acct.get("name", account_name)
             break
     if not profile_id:
-        names = [a.get("name") for a in accounts]
+        names = [
+            f"{a.get('name')} (custom_id={a.get('custom_id', '')})"
+            for a in accounts
+        ]
         return json.dumps({
             "success": False,
             "error": f"Account '{account_name}' not found. Available: {names}",
         })
 
     # Start profile (or reuse existing session)
+    # Use matched_name for session tracking so custom_id and name both hit cache
     with _sessions_lock:
-        session = _active_sessions.get(account_name)
+        session = _active_sessions.get(matched_name)
 
     ws_url = None
     if session:
         ws_url = session.get("ws_url")
-        logger.info("Reusing existing session for %s", account_name)
+        logger.info("Reusing existing session for %s", matched_name)
     else:
         try:
             ws_url, proxy_proc = _start_profile(profile_id)
@@ -496,7 +508,7 @@ def _handle_browse(args: dict, **kw) -> str:
             return json.dumps({"success": False, "error": str(e)})
 
         with _sessions_lock:
-            _active_sessions[account_name] = {
+            _active_sessions[matched_name] = {
                 "profile_id": profile_id,
                 "ws_url": ws_url,
                 "proxy_proc": proxy_proc,
@@ -509,13 +521,13 @@ def _handle_browse(args: dict, **kw) -> str:
         ))
         return json.dumps({
             "success": True,
-            "account": account_name,
+            "account": matched_name,
             "task": task,
             "result": result.get("extracted_content", ""),
             "steps_taken": result.get("steps", 0),
         })
     except Exception as e:
-        logger.exception("browser-use task failed for %s: %s", account_name, e)
+        logger.exception("browser-use task failed for %s: %s", matched_name, e)
         return json.dumps({
             "success": False,
             "error": f"Browser task failed: {type(e).__name__}: {e}",
@@ -644,8 +656,8 @@ ADSPOWER_LIST_ACCOUNTS_SCHEMA = {
     "name": "adspower_list_accounts",
     "description": (
         "List available AdsPower browser profiles for Facebook Marketplace "
-        "automation. Shows account names, profile IDs, and whether each has "
-        "an active browser session."
+        "automation. Shows account names, profile IDs, custom IDs, and "
+        "whether each has an active browser session."
     ),
     "parameters": {
         "type": "object",
@@ -669,8 +681,10 @@ ADSPOWER_BROWSE_SCHEMA = {
             "account_name": {
                 "type": "string",
                 "description": (
-                    "Account name from the config "
-                    "(use adspower_list_accounts to see available names)"
+                    "Account name, custom_id, or profile_id from the config "
+                    "(use adspower_list_accounts to see available accounts). "
+                    "Accepts any of: account name, custom_id (e.g. '5'), "
+                    "or profile_id (e.g. 'klaxcmjk')."
                 ),
             },
             "task": {
