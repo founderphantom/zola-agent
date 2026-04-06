@@ -107,15 +107,57 @@ Each cron run should follow this decision tree:
      - Has NOT hit 3 posts today (check `daily_post_counts`).
      - Has NOT posted within last 30 min (check `last_post_times`).
    - If no account is eligible right now, report "[SILENT]" (nothing to do this tick).
-6. **Execute the post:**
-   - Call `adspower_download_photos` if `photo_paths_windows` is empty for this listing. Ensure 5+ photos downloaded.
+6. **Duplicate check — BEFORE posting, verify the listing is not already on this profile:**
+   
+   Call `adspower_browse` on the chosen account with this task:
+   ```
+   adspower_browse(
+     custom_id="<ACCOUNT>",
+     task="Navigate to https://www.facebook.com/marketplace/you/selling
+     
+     Scroll through the active listings on this page. Look for any listing that matches
+     this address: '<LISTING_ADDRESS>'
+     
+     Check the listing titles, descriptions, and prices visible on the page.
+     A match means the SAME address (or a close variant like abbreviation/unit number difference)
+     AND similar price.
+     
+     If you find a matching listing already posted on this profile, respond:
+     'DUPLICATE FOUND: [listing title as shown on FB]'
+     
+     If you do NOT find a match after scrolling through all visible listings, respond:
+     'NO DUPLICATE: Safe to post'
+     
+     Do NOT click into individual listings — just scan the selling page overview.",
+     max_steps=20
+   )
+   ```
+   
+   **If DUPLICATE FOUND:**
+   - Do NOT post. Mark this account as already done in the state file:
+     ```python
+     item.setdefault('posted_on', []).append({
+         'account': ACCOUNT,
+         'posted_at': 'pre-existing',
+         'photos_used': 0,
+         'note': 'duplicate detected on FB selling page'
+     })
+     ```
+   - Call `adspower_close` on this profile.
+   - Report: `⚠️ Skipped E12950616 on Account 5 — listing already exists on this profile.`
+   - Move to the next eligible account+listing pair (go back to step 5).
+   
+   **If NO DUPLICATE:** Proceed to step 7.
+
+7. **Execute the post:**
+   - Call `adspower_download_photos` with ALL photo URLs if `photo_paths_windows` is empty for this listing. Download EVERY available photo (not just 5).
+   - **Select a photo subset for this account** — see anti-detection rule 3 (Photo subset rotation). Check which accounts have already posted this listing (from `posted_on`), determine which photo subset this account should use, and pass ONLY that subset to `file_paths`. Each account must get a different subset of photos. Minimum 5 photos per subset.
    - Call `adspower_browse` to create the listing on Facebook Marketplace on the chosen account.
-   - Use 5+ photos (shuffled order per account).
    - Use varied description per account (rephrase slightly — do NOT copy the exact same text to every account).
    - **The adspower_browse task prompt MUST include the photo validation instruction** (count 5+ thumbnails before Publish). See Workflow 4 Step 6a for the exact wording.
    - Call `adspower_close` after posting.
-7. **Validate result:** Check the `adspower_browse` response. If it indicates fewer than 5 photos were uploaded, record in `failed_on` with reason "photo_count_low". Do NOT count it as a successful post.
-8. **Update state — MANDATORY, DO NOT SKIP:** After every post attempt (success or fail), you MUST immediately update `~/.hermes/re-state.json` using `execute_code` with Python. This is the ONLY way progress is tracked across cron runs. If you skip this step, the next run will re-post the same listing on the same account.
+8. **Validate result:** Check the `adspower_browse` response. If it indicates fewer than 5 photos were uploaded, record in `failed_on` with reason "photo_count_low". Do NOT count it as a successful post.
+9. **Update state — MANDATORY, DO NOT SKIP:** After every post attempt (success or fail), you MUST immediately update `~/.hermes/re-state.json` using `execute_code` with Python. This is the ONLY way progress is tracked across cron runs. If you skip this step, the next run will re-post the same listing on the same account.
 
    ```python
    import json, os
@@ -127,6 +169,7 @@ Each cron run should follow this decision tree:
    LISTING_ID = '<LISTING_ID>'       # e.g. 'E12950616'
    ACCOUNT = '<ACCOUNT_CUSTOM_ID>'   # e.g. '5'
    PHOTOS = <NUMBER_OF_PHOTOS>       # e.g. 6
+   PHOTO_FILES = ['<photo1.jpg>', '<photo2.jpg>', ...]  # actual file paths used for this account
    SUCCESS = True                     # False if failed
    
    # Find the posting_queue entry for this listing
@@ -136,7 +179,8 @@ Each cron run should follow this decision tree:
                item.setdefault('posted_on', []).append({
                    'account': ACCOUNT,
                    'posted_at': datetime.now().isoformat(),
-                   'photos_used': PHOTOS
+                   'photos_used': PHOTOS,
+                   'photo_files': PHOTO_FILES
                })
            else:
                item.setdefault('failed_on', []).append({
@@ -169,7 +213,7 @@ Each cron run should follow this decision tree:
    
    Replace the placeholder values with actuals from the post you just completed. **If you don't update this file, the next cron run WILL re-post the same listing on the same account.**
 
-9. **Report:** Send status like: `✅ Posted E12950616 (123 Main St) on Account 5 (6 photos). 2/4 accounts done for this listing. Next eligible in ~25 min.`
+10. **Report:** Send status like: `✅ Posted E12950616 (123 Main St) on Account 5 (6 photos). 2/4 accounts done for this listing. Next eligible in ~25 min.`
 
 ### Cron Job Setup
 
@@ -498,7 +542,7 @@ adspower_browse(
      - If that returns nothing, try: document.querySelectorAll('img') and filter by size
      - Also check for background-image CSS: document.querySelectorAll('[style*=\"background-image\"]') and extract the URL from the style attribute
 
-  4. Select up to 10 of the best photos, prioritizing: kitchen, living room, bathroom, master bedroom, exterior/front, other bedrooms, backyard, laundry, parking. Use the alt text, filename, or surrounding context to identify room types.
+  4. Collect ALL available photo URLs — do NOT limit to 10. Download every photo the listing has. We need the full photo set so we can use different subsets on different Facebook profiles for anti-detection.
 
   Return the full listing details AND all photo URLs (as full https:// URLs, not relative paths).",
   max_steps=60
@@ -573,9 +617,28 @@ After extraction, call `adspower_close` on the account used.
    Turn 6: L2 on Profile B   (different listing, 30+ min since Turn 4 on B)
    ```
 
-3. **Photo order variation**: For each profile, shuffle the photo sequence differently
-   - Profile A might show: kitchen, bedroom, living room, bathroom, exterior
-   - Profile B might show: exterior, kitchen, bathroom, living room, bedroom
+3. **Photo subset rotation**: Each profile MUST use a DIFFERENT subset of photos, not just a different order. This is critical for anti-detection — identical photo sets across profiles will get flagged.
+   
+   **Strategy**: Given N total photos and P target accounts, divide photos into rotating subsets:
+   - Each subset must have at least 5 photos (minimum for posting)
+   - Each subset should share ~2-3 "anchor" photos (best photos: kitchen, exterior, living room) for listing quality
+   - The remaining photos in each subset should be UNIQUE to that profile
+   
+   **Example** — listing with 15 photos, 4 profiles:
+   - Anchor photos (shared): photo 1 (kitchen), photo 2 (exterior), photo 3 (living room)
+   - Profile A (account 5):  anchors + photos 4, 5, 6, 7     → 7 photos
+   - Profile B (account 22): anchors + photos 8, 9, 10, 11    → 7 photos
+   - Profile C (account 24): anchors + photos 12, 13, 14, 15  → 7 photos
+   - Profile D (account 50): anchors + photos 4, 8, 12, 5     → 7 photos (wrap around)
+   
+   **Example** — listing with only 5-6 photos, 4 profiles:
+   - Not enough for unique subsets, so shuffle order differently per profile AND vary which photo is the cover (first) photo
+   - Profile A: [1, 3, 5, 2, 4]
+   - Profile B: [3, 5, 1, 4, 2]
+   - Profile C: [5, 2, 4, 1, 3]
+   - Profile D: [2, 4, 1, 3, 5]
+   
+   When building the `file_paths` array for `adspower_browse`, select the subset for the current account and shuffle their order within the subset.
 
 4. **Description variation**: For each profile, generate a different description:
    - Profile A: formal tone, lead with location/neighborhood, different adjectives
@@ -627,7 +690,7 @@ Reply YES to begin, or tell me what to change.
 
 ### Step 5.5 — Download Photos to Windows (once, before posting begins)
 
-**Do this ONCE after operator confirms, before any posting starts.** Download all photos for all listings using `adspower_download_photos`. Do NOT re-download for each profile — download once and reuse.
+**Do this ONCE after operator confirms, before any posting starts.** Download ALL photos for all listings using `adspower_download_photos`. Do NOT re-download for each profile — download once and reuse. Download EVERY photo the listing has (not just 5 or 10) — we need the full set to rotate different subsets across profiles.
 
 For **each listing** extracted in Step 3A/3B, call `adspower_download_photos` with the photo URLs:
 
@@ -712,7 +775,7 @@ adspower_browse(
 
 **How it works under the hood**: `file_paths` are passed as `available_file_paths` directly to the browser-use Agent constructor. The built-in `upload_file` action dispatches a CDP `UploadFileEvent` which calls `DOM.setFileInputFiles` — completely bypassing the native OS file picker. Because AdsPower is connected via `cdp_url`, `browser_session.is_local == False`, so the built-in action skips the `os.path.exists()` check (which would fail for Windows paths on WSL) and sends the Windows path directly to Chrome where the file is accessible. The `file_paths` MUST be Windows paths (e.g. `C:\Users\...`), not WSL paths.
 
-**Shuffle the `file_paths` order differently for each profile** — don't use the same photo sequence across accounts.
+**Select a DIFFERENT photo subset for each profile** — see anti-detection rule 3 (Photo subset rotation). Do NOT pass the same photos to every profile. Pick the subset for this account, shuffle within the subset, then pass to `file_paths`.
 
 For **Telegram photos** (Step 3C): convert the WSL paths to Windows UNC paths and pass them via `file_paths`:
 - WSL: `/home/jamaal/.hermes/cache/images/img_abc123.jpg`
@@ -957,7 +1020,7 @@ hermes cron create \
 - Never navigate to Facebook settings, privacy, or account pages unless explicitly asked
 - **Always call `adspower_close` when done** — zombie browsers waste RAM and may trigger detection
 - When bulk posting, **scramble the posting order** — don't post listings sequentially or the same listing back-to-back on different profiles
-- **Shuffle photo order per profile** — don't upload photos in the same sequence across accounts
+- **Different photo subsets per profile** — each profile MUST use a different subset of photos, not just different order. See anti-detection rule 3 (Photo subset rotation). Identical photo sets across profiles will get flagged.
 - **Vary descriptions per profile** — change tone, word choice, feature ordering, adjectives (spacious vs roomy, modern vs updated, bright vs sun-filled)
 - If a bulk queue exceeds 3 listings per account in one day, **split across days** and notify the operator
 - Track posting timestamps per account in memory to enforce spacing across sessions
