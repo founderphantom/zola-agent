@@ -101,13 +101,15 @@ Each cron run should follow this decision tree:
    - Check `last_post_times` — skip accounts posted within last 30 min.
    - If no account is eligible right now, report "[SILENT]" (nothing to do this tick).
 6. **Execute the post:**
-   - Call `adspower_download_photos` if `photo_paths_windows` is empty.
+   - Call `adspower_download_photos` if `photo_paths_windows` is empty. Ensure 5+ photos downloaded.
    - Call `adspower_browse` to create the listing on Facebook Marketplace.
    - Use 5+ photos (shuffled order per account).
    - Use varied description per account.
+   - **The adspower_browse task prompt MUST include the photo validation instruction** (count 5+ thumbnails before Publish). See Workflow 4 Step 6a for the exact wording.
    - Call `adspower_close` after posting.
-7. **Update state:** Mark post as "posted" or "failed", update counters.
-8. **Report:** Send status line like `✅ Posted 5/30: 123 Main St on Account 5 (6 photos). Next eligible in ~25 min.`
+7. **Validate result:** Check the `adspower_browse` response. If it indicates fewer than 5 photos were uploaded, mark the post as "failed" with reason "photo_count_low" and move to the next queue item. Do NOT count it as a successful post.
+8. **Update state:** Mark post as "posted" or "failed", update counters.
+9. **Report:** Send status line like `✅ Posted 5/30: 123 Main St on Account 5 (6 photos). Next eligible in ~25 min.`
 
 ### Cron Job Setup
 
@@ -592,7 +594,7 @@ This downloads the images directly to a Windows-accessible directory and returns
 
 Repeat for each listing (listing_1, listing_2, etc.).
 
-**If download fails for any listing**: Pause and notify the operator. Facebook Marketplace requires at least 1 photo — do NOT attempt to post without photos. Wait for operator to resolve the issue before proceeding.
+**If download fails for any listing**: Pause and notify the operator. We require at least 5 photos per listing — do NOT attempt to post without 5+ photos. Wait for operator to resolve the issue before proceeding.
 
 For **Telegram photos** (Step 3C): skip this step — photos are already on disk. Use the WSL UNC paths directly in the file upload dialog.
 
@@ -620,10 +622,22 @@ adspower_browse(
 
   To upload photos, use the upload_file action with the element index and
   file path. Click the photo upload area first, then call upload_file for
-  each photo from the available files list.
+  EACH photo from the available files list. You MUST upload ALL provided photos,
+  not just the first one.
 
-  After filling all fields and uploading all photos, click Publish/Post.
-  Confirm the listing was posted by looking for a success message or redirect.",
+  CRITICAL PHOTO VALIDATION — DO NOT SKIP:
+  After uploading photos, STOP and count the photo thumbnails visible in the
+  listing form. You MUST see at least 5 photo thumbnails before proceeding.
+  If fewer than 5 photos are shown:
+    1. Click the photo upload area again
+    2. Upload more photos from the available files list
+    3. Re-count the thumbnails
+    4. Repeat until 5+ thumbnails are visible
+  If you cannot reach 5 photos after 3 attempts, DO NOT publish — report failure.
+
+  Only after confirming 5+ photo thumbnails are visible, click Publish/Post.
+  Confirm the listing was posted by looking for a success message or redirect.
+  In your final response, report the exact number of photos uploaded.",
   file_paths=[
     "C:\\Users\\Jamaal\\Downloads\\listing_photos\\listing_N_photo_3.jpg",
     "C:\\Users\\Jamaal\\Downloads\\listing_photos\\listing_N_photo_1.jpg",
@@ -701,8 +715,179 @@ If logged out or checkpointed, **stop and notify the operator immediately**. Do 
 
 ---
 
+## Workflow 5: Autonomous Message Monitoring & Reply (Cron Mode)
+
+When the cron prompt mentions "check messages", "reply to inquiries", or "inbox":
+
+### Step 1 — Check Inboxes Across All Profiles
+
+For each active account, open the Marketplace inbox and read new messages:
+
+```
+adspower_browse(
+  account_name="<account>",
+  task="Navigate to https://www.facebook.com/marketplace/inbox/ and read ALL unread conversations. For each conversation, extract:
+  - Sender's name
+  - Which listing they are asking about (address or listing title)
+  - Their exact message text
+  - Timestamp
+  - Whether you have already replied (check if last message is from you)
+  
+  Only report conversations where the LAST message is from the other person (not from you).
+  Return a numbered list of all new inquiries.",
+  max_steps=40
+)
+```
+
+Call `adspower_close` after checking each account before moving to the next.
+
+### Step 2 — Auto-Reply to Common Inquiries
+
+The agent CAN auto-reply to these common inquiry types WITHOUT operator confirmation:
+
+| Inquiry Type | Auto-Reply Template |
+|-------------|-------------------|
+| "Is this still available?" | "Yes, this listing is still available! Would you like to schedule a viewing?" |
+| "What's the rent/price?" | "The monthly rent is $[price] as listed. Would you like more details or to schedule a viewing?" |
+| "When can I see it?" / "Can I view?" | "I'd be happy to arrange a showing! What days/times work best for you this week?" |
+| "How many bedrooms/bathrooms?" | "This property has [beds] bedrooms and [baths] bathrooms. Would you like to schedule a viewing?" |
+| "Is [amenity] included?" | "Great question! Let me check on that specific detail and get back to you shortly." |
+| "Pet policy?" | "Let me confirm the pet policy for this property and get back to you. Are you looking for a dog or cat-friendly unit?" |
+| General interest / "Tell me more" | "Thanks for your interest! This is a lovely [beds]BR/[baths]BA [type] at [address] for $[price]/mo. Would you like to schedule a viewing?" |
+
+To send a reply:
+
+```
+adspower_browse(
+  account_name="<account>",
+  task="Open Facebook Marketplace inbox. Find the conversation with [person's name] about [listing]. Type this reply: '[reply text]' and send it. Confirm the message was sent.",
+  max_steps=30
+)
+```
+
+### Step 3 — Escalate Complex Questions to Telegram
+
+The agent MUST escalate to Telegram (via `send_message` tool) for:
+- Negotiation on price ("Can you lower the rent?", "What's your best price?")
+- Lease terms or legal questions ("What's the lease length?", "Is subletting allowed?")
+- Maintenance or repair requests
+- Application process questions ("How do I apply?", "What documents do I need?")
+- Anything requiring a decision the agent cannot make
+- Any message the agent is unsure how to answer
+
+Format for Telegram escalation:
+
+```
+📩 New inquiry needs attention:
+- Profile: [account name / custom_id]
+- From: [person's name]
+- About: [listing address]
+- Message: "[exact message text]"
+- Suggested reply: "[agent's best guess, or 'unsure']"
+
+Reply with your response, or "skip" to ignore.
+```
+
+### Step 4 — Showing Scheduling
+
+When someone wants to schedule a showing:
+
+1. **Auto-reply immediately:** "I'd be happy to arrange a showing! What days/times work best for you this week?"
+
+2. **When they reply with times**, notify Telegram:
+```
+📅 Showing request:
+- Property: [address]
+- Requester: [name] via FB Marketplace
+- Requested times: [their availability]
+- Profile: [account name / custom_id]
+
+Reply with confirmed time, or "suggest: [alternative times]"
+```
+
+3. **Wait for operator's Telegram response** before confirming the showing time back to the requester on Facebook.
+
+### Step 5 — Report Summary
+
+After checking all profiles, report:
+
+```
+📬 Inbox Check Complete
+
+Profiles checked: [N]
+New inquiries: [N]
+Auto-replied: [N]
+Escalated to Telegram: [N]
+Showing requests: [N]
+
+Details:
+- Account [X]: [N] new messages — [N] auto-replied, [N] escalated
+- Account [Y]: [N] new messages — [N] auto-replied, [N] escalated
+```
+
+If no new messages across all profiles, respond with `[SILENT]` to suppress delivery.
+
+### Message State Tracking
+
+Track message handling in `~/.hermes/re-state.json` under the `message_tracking` key:
+
+```json
+{
+  "message_tracking": {
+    "last_inbox_check": {
+      "5": "2026-04-06T10:00:00",
+      "22": "2026-04-06T10:05:00"
+    },
+    "auto_replied": [
+      {
+        "account": "5",
+        "from": "Jane",
+        "about": "123 Main St",
+        "inquiry": "Is this available?",
+        "reply": "Yes, this listing is still available!...",
+        "replied_at": "2026-04-06T10:02:00"
+      }
+    ],
+    "pending_escalations": [
+      {
+        "account": "5",
+        "from": "John",
+        "about": "123 Main St",
+        "message": "Can you do $2200?",
+        "escalated_at": "2026-04-06T10:00:00",
+        "resolved": false
+      }
+    ],
+    "showing_requests": [
+      {
+        "account": "22",
+        "from": "Sarah",
+        "property": "456 Oak Ave",
+        "requested_times": "Saturday 2pm or Sunday 10am",
+        "confirmed_time": null,
+        "requested_at": "2026-04-06T10:05:00"
+      }
+    ]
+  }
+}
+```
+
+### Cron Job Setup
+
+```
+hermes cron create \
+  --name "fb-marketplace-inbox" \
+  --schedule "every 2h" \
+  --skill real-estate-assistant \
+  --deliver origin \
+  --prompt "Check Facebook Marketplace inbox on all active profiles. Auto-reply to common inquiries (availability, pricing, showing requests). Escalate complex questions to Telegram. Update message tracking in re-state.json. Close each profile after checking."
+```
+
+---
+
 ## Anti-Detection Rules
 
+- **Minimum 5 photos per listing** — NEVER publish a listing with fewer than 5 photos. More photos = better engagement and more realistic listings. Verify photo thumbnail count in the form before clicking Publish.
 - Max **3 listings per account per day**
 - Space listings **30+ minutes apart** on the same account
 - Never post identical listing text on multiple accounts — vary the descriptions
@@ -714,6 +899,18 @@ If logged out or checkpointed, **stop and notify the operator immediately**. Do 
 - **Vary descriptions per profile** — change tone, word choice, feature ordering, adjectives (spacious vs roomy, modern vs updated, bright vs sun-filled)
 - If a bulk queue exceeds 3 listings per account in one day, **split across days** and notify the operator
 - Track posting timestamps per account in memory to enforce spacing across sessions
+
+---
+
+## Cron Job Scheduling — Avoiding Conflicts
+
+The hermes cron system runs jobs **sequentially** (file-locked tick via `~/.hermes/cron/.tick.lock`). Jobs never overlap — if a posting job is running, the inbox job waits until it finishes. This means:
+
+1. **Always call `adspower_close()` at the end of every cron job** — this releases the browser profile so the next job can use it. Failing to close profiles will cause the next job to fail with "already active".
+2. **The posting job (`every 35m`) and inbox job (`every 2h`) may occasionally be due at the same tick** — the scheduler runs them one after another, which is safe.
+3. **If a profile fails to open** with "already active" error, call `adspower_close` on it first, wait 5 seconds, then retry.
+4. **Never leave zombie browser sessions** — the cron agent should always close ALL opened profiles before completing, even if errors occur. Use a try/finally pattern in your logic.
+5. **State file locking**: Both posting and inbox jobs read/write `~/.hermes/re-state.json`. Since jobs run sequentially, there is no race condition — but always read the latest state at the start of each job.
 
 ---
 
