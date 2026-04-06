@@ -108,7 +108,49 @@ Each cron run should follow this decision tree:
    - **The adspower_browse task prompt MUST include the photo validation instruction** (count 5+ thumbnails before Publish). See Workflow 4 Step 6a for the exact wording.
    - Call `adspower_close` after posting.
 7. **Validate result:** Check the `adspower_browse` response. If it indicates fewer than 5 photos were uploaded, mark the post as "failed" with reason "photo_count_low" and move to the next queue item. Do NOT count it as a successful post.
-8. **Update state:** Mark post as "posted" or "failed", update counters.
+8. **Update state — MANDATORY, DO NOT SKIP:** After every post attempt (success or fail), you MUST immediately update `~/.hermes/re-state.json` using `execute_code` with Python. This is the ONLY way progress is tracked across cron runs. If you skip this step, the next run will re-post the same listing.
+
+   ```python
+   import json
+   from datetime import datetime
+   
+   with open(os.path.expanduser('~/.hermes/re-state.json')) as f:
+       state = json.load(f)
+   
+   # Find the posting_queue entry and update it
+   for item in state['posting_queue']:
+       if item['listing_id'] == '<LISTING_ID>' and item.get('status') == 'pending':
+           item['status'] = 'posted'  # or 'failed'
+           item['account'] = '<ACCOUNT_CUSTOM_ID>'
+           item['posted_at'] = datetime.now().isoformat()
+           item['photos_used'] = <NUMBER_OF_PHOTOS>
+           break
+   
+   # Update counters
+   today = datetime.now().strftime('%Y-%m-%d')
+   state['daily_post_counts'].setdefault(today, {})
+   state['daily_post_counts'][today]['<ACCOUNT_CUSTOM_ID>'] = state['daily_post_counts'][today].get('<ACCOUNT_CUSTOM_ID>', 0) + 1
+   state['last_post_times']['<ACCOUNT_CUSTOM_ID>'] = datetime.now().isoformat()
+   state['stats']['total_posted'] += 1  # or total_failed for failures
+   state.setdefault('batch1_posted', 0)
+   if state.get('current_batch') == 1:
+       state['batch1_posted'] += 1
+   
+   # Queue next pending listing if posting_queue has no more pending items
+   pending = [p for p in state['posting_queue'] if p.get('status') == 'pending']
+   if not pending:
+       # Find extracted listings not yet in posting_queue
+       queued_ids = {p['listing_id'] for p in state['posting_queue']}
+       for listing in state['extracted_listings']:
+           if listing['id'] not in queued_ids:
+               state['posting_queue'].append({'listing_id': listing['id'], 'status': 'pending'})
+   
+   with open(os.path.expanduser('~/.hermes/re-state.json'), 'w') as f:
+       json.dump(state, f, indent=2)
+   ```
+   
+   Replace `<LISTING_ID>`, `<ACCOUNT_CUSTOM_ID>`, and `<NUMBER_OF_PHOTOS>` with actual values from the post you just completed. **If you don't update this file, the next cron run WILL re-post the same listing.**
+
 9. **Report:** Send status line like `✅ Posted 5/30: 123 Main St on Account 5 (6 photos). Next eligible in ~25 min.`
 
 ### Cron Job Setup
@@ -148,6 +190,8 @@ hermes cron create \
 The correct tools are registered in your tool list. Using `execute_code` to call `_handle_browse`, `_start_profile`, or any other internal function directly is wrong — it bypasses the gateway environment, loses session tracking, and will fail with incorrect env vars.
 
 If `adspower_browse` does not appear in your tool list, the fix is an environment issue — tell the operator to check `~/.hermes/.env`, NOT to use execute_code as a workaround.
+
+**Exception:** You MUST use `execute_code` for reading and writing `~/.hermes/re-state.json`. This is a plain JSON file, not an AdsPower API call. State updates after every post are mandatory — see Cron Cycle Logic Step 8.
 
 ## Available Tools
 
