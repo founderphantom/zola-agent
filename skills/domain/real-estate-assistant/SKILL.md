@@ -50,17 +50,20 @@ This file tracks the entire pipeline state across cron runs:
   "posting_queue": [
     {
       "listing_id": "listing_1",
-      "account_custom_id": "5",
-      "status": "posted",
-      "posted_at": "2026-04-03T12:30:00",
-      "photos_used": 6
+      "target_accounts": ["5", "22", "24", "50"],
+      "posted_on": [
+        {"account": "5", "posted_at": "2026-04-03T12:30:00", "photos_used": 6},
+        {"account": "50", "posted_at": "2026-04-03T13:05:00", "photos_used": 6}
+      ],
+      "failed_on": [],
+      "status": "in_progress"
     },
     {
       "listing_id": "listing_2",
-      "account_custom_id": "22",
-      "status": "pending",
-      "posted_at": null,
-      "photos_used": 0
+      "target_accounts": ["5", "22", "24", "50"],
+      "posted_on": [],
+      "failed_on": [],
+      "status": "pending"
     }
   ],
   "accounts": ["5", "22", "24", "32", "33", "50"],
@@ -85,73 +88,88 @@ This file tracks the entire pipeline state across cron runs:
 Each cron run should follow this decision tree:
 
 1. **Load state** from `~/.hermes/re-state.json` (create if missing).
-2. **Check: Are there pending items in `posting_queue`?**
-   - YES → Go to step 5 (post next pending item).
+2. **Check: Are there items in `posting_queue` that still need posting on some accounts?**
+   - A listing is "done" when ALL `target_accounts` appear in its `posted_on` or `failed_on` arrays.
+   - A listing is "in_progress" or "pending" if some `target_accounts` still have no entry.
+   - YES (incomplete listings exist) → Go to step 5.
    - NO → Go to step 3.
-3. **Check: Do we have un-queued extracted listings?**
-   - YES → Build a new posting queue (scrambled, all accounts) → Go to step 5.
+3. **Check: Do we have extracted listings not yet in `posting_queue`?**
+   - YES → Add them to posting_queue with appropriate `target_accounts` (batch1 → `batch1_accounts`, batch2 → `batch2_accounts`) → Go to step 5.
    - NO → Go to step 4.
-4. **Extract more listings** from `portal_url` using `adspower_browse`.
+4. **Extract more listings** from `portal_url` (or `portal_url_batch2` if batch 1 is done) using `adspower_browse`.
    - Download photos via `adspower_download_photos`.
    - Save to state file.
-   - Build posting queue.
+   - Add to posting queue.
    - **If this is the first cron run**, the operator's prompt should include the portal URL.
-5. **Find the next eligible pending post:**
-   - Check `daily_post_counts` — skip accounts that hit 3 today.
-   - Check `last_post_times` — skip accounts posted within last 30 min.
+5. **Find the next eligible account+listing pair:**
+   - Pick the first listing in `posting_queue` that has remaining `target_accounts` not in `posted_on`/`failed_on`.
+   - From that listing's remaining accounts, pick one that:
+     - Has NOT hit 3 posts today (check `daily_post_counts`).
+     - Has NOT posted within last 30 min (check `last_post_times`).
    - If no account is eligible right now, report "[SILENT]" (nothing to do this tick).
 6. **Execute the post:**
-   - Call `adspower_download_photos` if `photo_paths_windows` is empty. Ensure 5+ photos downloaded.
-   - Call `adspower_browse` to create the listing on Facebook Marketplace.
+   - Call `adspower_download_photos` if `photo_paths_windows` is empty for this listing. Ensure 5+ photos downloaded.
+   - Call `adspower_browse` to create the listing on Facebook Marketplace on the chosen account.
    - Use 5+ photos (shuffled order per account).
-   - Use varied description per account.
+   - Use varied description per account (rephrase slightly — do NOT copy the exact same text to every account).
    - **The adspower_browse task prompt MUST include the photo validation instruction** (count 5+ thumbnails before Publish). See Workflow 4 Step 6a for the exact wording.
    - Call `adspower_close` after posting.
-7. **Validate result:** Check the `adspower_browse` response. If it indicates fewer than 5 photos were uploaded, mark the post as "failed" with reason "photo_count_low" and move to the next queue item. Do NOT count it as a successful post.
-8. **Update state — MANDATORY, DO NOT SKIP:** After every post attempt (success or fail), you MUST immediately update `~/.hermes/re-state.json` using `execute_code` with Python. This is the ONLY way progress is tracked across cron runs. If you skip this step, the next run will re-post the same listing.
+7. **Validate result:** Check the `adspower_browse` response. If it indicates fewer than 5 photos were uploaded, record in `failed_on` with reason "photo_count_low". Do NOT count it as a successful post.
+8. **Update state — MANDATORY, DO NOT SKIP:** After every post attempt (success or fail), you MUST immediately update `~/.hermes/re-state.json` using `execute_code` with Python. This is the ONLY way progress is tracked across cron runs. If you skip this step, the next run will re-post the same listing on the same account.
 
    ```python
-   import json
+   import json, os
    from datetime import datetime
    
    with open(os.path.expanduser('~/.hermes/re-state.json')) as f:
        state = json.load(f)
    
-   # Find the posting_queue entry and update it
+   LISTING_ID = '<LISTING_ID>'       # e.g. 'E12950616'
+   ACCOUNT = '<ACCOUNT_CUSTOM_ID>'   # e.g. '5'
+   PHOTOS = <NUMBER_OF_PHOTOS>       # e.g. 6
+   SUCCESS = True                     # False if failed
+   
+   # Find the posting_queue entry for this listing
    for item in state['posting_queue']:
-       if item['listing_id'] == '<LISTING_ID>' and item.get('status') == 'pending':
-           item['status'] = 'posted'  # or 'failed'
-           item['account'] = '<ACCOUNT_CUSTOM_ID>'
-           item['posted_at'] = datetime.now().isoformat()
-           item['photos_used'] = <NUMBER_OF_PHOTOS>
+       if item['listing_id'] == LISTING_ID:
+           if SUCCESS:
+               item.setdefault('posted_on', []).append({
+                   'account': ACCOUNT,
+                   'posted_at': datetime.now().isoformat(),
+                   'photos_used': PHOTOS
+               })
+           else:
+               item.setdefault('failed_on', []).append({
+                   'account': ACCOUNT,
+                   'failed_at': datetime.now().isoformat(),
+                   'reason': 'photo_count_low'
+               })
+           # Update status: check if all target accounts are covered
+           done_accounts = {p['account'] for p in item.get('posted_on', [])} | {f['account'] for f in item.get('failed_on', [])}
+           remaining = set(item.get('target_accounts', [])) - done_accounts
+           if not remaining:
+               item['status'] = 'complete'
+           else:
+               item['status'] = 'in_progress'
            break
    
    # Update counters
    today = datetime.now().strftime('%Y-%m-%d')
    state['daily_post_counts'].setdefault(today, {})
-   state['daily_post_counts'][today]['<ACCOUNT_CUSTOM_ID>'] = state['daily_post_counts'][today].get('<ACCOUNT_CUSTOM_ID>', 0) + 1
-   state['last_post_times']['<ACCOUNT_CUSTOM_ID>'] = datetime.now().isoformat()
-   state['stats']['total_posted'] += 1  # or total_failed for failures
-   state.setdefault('batch1_posted', 0)
-   if state.get('current_batch') == 1:
-       state['batch1_posted'] += 1
-   
-   # Queue next pending listing if posting_queue has no more pending items
-   pending = [p for p in state['posting_queue'] if p.get('status') == 'pending']
-   if not pending:
-       # Find extracted listings not yet in posting_queue
-       queued_ids = {p['listing_id'] for p in state['posting_queue']}
-       for listing in state['extracted_listings']:
-           if listing['id'] not in queued_ids:
-               state['posting_queue'].append({'listing_id': listing['id'], 'status': 'pending'})
+   state['daily_post_counts'][today][ACCOUNT] = state['daily_post_counts'][today].get(ACCOUNT, 0) + 1
+   state['last_post_times'][ACCOUNT] = datetime.now().isoformat()
+   if SUCCESS:
+       state['stats']['total_posted'] = state['stats'].get('total_posted', 0) + 1
+   else:
+       state['stats']['total_failed'] = state['stats'].get('total_failed', 0) + 1
    
    with open(os.path.expanduser('~/.hermes/re-state.json'), 'w') as f:
        json.dump(state, f, indent=2)
    ```
    
-   Replace `<LISTING_ID>`, `<ACCOUNT_CUSTOM_ID>`, and `<NUMBER_OF_PHOTOS>` with actual values from the post you just completed. **If you don't update this file, the next cron run WILL re-post the same listing.**
+   Replace the placeholder values with actuals from the post you just completed. **If you don't update this file, the next cron run WILL re-post the same listing on the same account.**
 
-9. **Report:** Send status line like `✅ Posted 5/30: 123 Main St on Account 5 (6 photos). Next eligible in ~25 min.`
+9. **Report:** Send status like: `✅ Posted E12950616 (123 Main St) on Account 5 (6 photos). 2/4 accounts done for this listing. Next eligible in ~25 min.`
 
 ### Cron Job Setup
 
